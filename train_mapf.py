@@ -521,5 +521,5 @@ if __name__ == "__main__":
         obs_radius=3,
     )
 
-    algo = train_mappo(env, total_episodes=1000, device=device)
+    algo = train_mappo(env, total_episodes=5000, rollout_len=128, device=device)
     torch.save(algo.actor.state_dict(), f"mappo_{env.obs_mode}_actor.pth")
