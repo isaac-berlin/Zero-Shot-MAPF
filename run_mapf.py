@@ -126,8 +126,8 @@ if __name__ == "__main__":
 
     # Example usage:
     run_policy(
-        actor_path="mappo_window_actor.pth",  # or mappo_window_actor.pth or mappo_knn_actor.pth
-        obs_mode="window",                    # "vector", "window", or "knn"
+        actor_path="mappo_knn_actor.pth",  # or mappo_window_actor.pth or mappo_knn_actor.pth
+        obs_mode="knn",                    # "vector", "window", or "knn"
         grid_size=7,
         num_agents=3,
         stochastic=True,

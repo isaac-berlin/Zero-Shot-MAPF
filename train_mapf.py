@@ -517,7 +517,7 @@ if __name__ == "__main__":
     env = MAPF(
         grid_size=10,
         num_agents=4,
-        obs_mode="window",  # "vector", "window", "knn"
+        obs_mode="knn",  # "vector", "window", "knn"
         obs_radius=3,
     )
 
