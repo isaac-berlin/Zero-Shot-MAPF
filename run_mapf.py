@@ -2,7 +2,7 @@ import torch
 from torch.distributions import Categorical
 
 from MAPF import MAPF
-from train_mapf import ActorMLP, ActorCNN, stack_global_state
+from train_mapf import ActorMLP, ActorCNN, ActorHybrid, stack_global_state
 
 
 # ============================================================
@@ -21,6 +21,11 @@ def load_actor_for_mode(obs_mode, obs_sample, n_actions, device):
         # obs_sample = (H, W, C)
         obs_shape = obs_sample.shape
         actor = ActorCNN(obs_shape, n_actions)
+    elif obs_mode == "hybrid":
+        # obs_sample = Dict with "vector" and "window"
+        vector_dim = obs_sample["vector"].shape[0]
+        window_shape = obs_sample["window"].shape
+        actor = ActorHybrid(vector_dim, window_shape, n_actions)
     else:
         raise ValueError(f"Unknown obs_mode: {obs_mode}")
 
@@ -93,10 +98,18 @@ def run_policy(
             for a in agent_order:
                 o = obs[a]
 
-                # ActorCNN expects (B,H,W,C), ActorMLP expects (B,D)
-                o_t = torch.tensor(o, dtype=torch.float32, device=device).unsqueeze(0)
-
+                # Preprocess obs for the correct actor type
+                if obs_mode == "hybrid":
+                    o_vector = torch.tensor(o["vector"], dtype=torch.float32, device=device).unsqueeze(0)
+                    o_window = torch.tensor(o["window"], dtype=torch.float32, device=device).unsqueeze(0)
+                    o_t = {"vector": o_vector, "window": o_window}
+                elif obs_mode == "window":
+                    o_t = torch.tensor(o, dtype=torch.float32, device=device).unsqueeze(0).permute(0, 3, 1, 2) # to (B,C,H,W)
+                else:
+                    o_t = torch.tensor(o, dtype=torch.float32, device=device).unsqueeze(0)
+                
                 logits = actor(o_t)
+                
                 dist = Categorical(logits=logits)
 
                 if stochastic:

@@ -39,12 +39,12 @@ class MAPF(ParallelEnv):
         self,
         grid_size=7,
         num_agents=2,
-        obs_mode="vector",    # "vector", "window", or "knn"
+        obs_mode="hybrid",    # "vector", "window", "knn", or "hybrid"
         obs_radius=3,         # used only for window mode
         k_agents=2,           # used only for knn mode
     ):
 
-        assert obs_mode in ("vector", "window", "knn")
+        assert obs_mode in ("vector", "window", "knn", "hybrid")
         self.obs_mode = obs_mode
 
         self.grid_size = grid_size
@@ -109,7 +109,15 @@ class MAPF(ParallelEnv):
             # heading (1) + k_agents * 3 + own goal (3)
             size = 1 + (self.k_agents ) * 3 + 3
             return spaces.Box(low=-np.inf, high=np.inf, shape=(size,), dtype=np.float32)
-
+        
+        elif self.obs_mode == "hybrid":
+            # vector + window
+            w = 2 * self.obs_radius + 1 # window part
+            knn_size = 1 + (self.k_agents ) * 3 + 3 # same as knn vector part
+            return spaces.Dict({
+                "vector": spaces.Box(low=-1, high=np.inf, shape=(knn_size,), dtype=np.float32),
+                "window": spaces.Box(low=-1, high=1, shape=(w, w, 3), dtype=np.float32),
+            })
     # ============================================================
     # Reset
     # ============================================================
@@ -220,7 +228,7 @@ class MAPF(ParallelEnv):
 
         # Only truncate by time (no "all goals reached" terminal condition now)
         truncated = self.timestep >= self.max_steps
-        dones = {a: truncated or truncated for a in self.agents}
+        dones = {a: truncated for a in self.agents}
         truncs = {a: truncated for a in self.agents}
 
         if truncated:
@@ -279,6 +287,11 @@ class MAPF(ParallelEnv):
             return self._obs_window(agent)
         elif self.obs_mode == "knn":
             return self._obs_knn(agent)
+        elif self.obs_mode == "hybrid":
+            return {
+                "vector": self._obs_knn(agent),
+                "window": self._obs_window(agent),
+            }
 
     # ============================================================
     # Vector Observation

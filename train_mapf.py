@@ -41,6 +41,60 @@ def stack_global_state(env) -> np.ndarray:
 # ============================================================
 # Actor / Critic Networks
 # ============================================================
+class ActorHybrid(nn.Module):
+    def __init__(self, obs_spec, n_actions, hidden=128):
+        super().__init__()
+        H, W, C = obs_spec["window"]
+        vec_dim = obs_spec["vector"][0]
+        
+        self.cnn = nn.Sequential(
+            nn.Conv2d(C, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.ReLU(),
+        )
+        
+        with torch.no_grad():
+            x = torch.zeros(1, C, H, W)
+            conv_out = self.cnn(x).view(1, -1).shape[1]
+
+        self.cnn_fc = nn.Sequential(
+            nn.LayerNorm(conv_out),
+            nn.Linear(conv_out, hidden),
+            nn.Tanh(),
+        )
+        
+        self.knn_fc = nn.Sequential(
+            nn.LayerNorm(vec_dim),
+            nn.Linear(vec_dim, hidden),
+            nn.Tanh(),
+        )
+        
+        self.fusion_fc = nn.Sequential(
+            nn.Linear(2 * hidden, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, n_actions),
+        )
+        
+    def forward(self, obs):
+        # obs is a dict with "vector" and "window"
+        vec_obs = obs["vector"]
+        win_obs = obs["window"]
+
+        # process window through CNN
+        win_x = win_obs.permute(0, 3, 1, 2)  # (B, H, W, C) → (B, C, H, W)
+        win_feat = self.cnn(win_x)
+        win_feat = win_feat.reshape(win_feat.size(0), -1)
+        win_out = self.cnn_fc(win_feat)
+
+        # process vector through MLP
+        knn_out = self.knn_fc(vec_obs)
+
+        # fuse and output action logits
+        fusion_input = torch.cat([win_out, knn_out], dim=-1)
+        return self.fusion_fc(fusion_input)
 
 class ActorMLP(nn.Module):
     """Used for obs_mode = vector or knn."""
@@ -119,7 +173,7 @@ class CentralCritic(nn.Module):
 
 @dataclass
 class Transition:
-    obs: np.ndarray
+    obs: object
     state: np.ndarray
     action: int
     logp: float
@@ -208,6 +262,8 @@ class MAPPO:
         elif obs_mode == "window":
             obs_shape = obs_spec
             self.actor = ActorCNN(obs_shape, n_actions).to(device)
+        elif obs_mode == "hybrid":
+            self.actor = ActorHybrid(obs_spec, n_actions).to(device)
         else:
             raise ValueError(f"Unknown obs_mode: {obs_mode}")
 
@@ -223,8 +279,14 @@ class MAPPO:
 
     @torch.no_grad()
     def act(self, obs, state):
-        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         state_t = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+        if self.mode == "hybrid":
+            obs_t = {
+                "vector": torch.tensor(obs["vector"], dtype=torch.float32, device=self.device).unsqueeze(0),
+                "window": torch.tensor(obs["window"], dtype=torch.float32, device=self.device).unsqueeze(0),
+            }
+        else:
+            obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
 
         logits = self.actor(obs_t)
         dist = Categorical(logits=logits)
@@ -238,14 +300,23 @@ class MAPPO:
         obs, state, acts, old_logps, old_vals, advs, rets = buffer.get_flat_batches()
         advs = (advs - advs.mean()) / (advs.std() + 1e-8)
 
-        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device)
+        if self.mode == "hybrid":
+            obs_t = {
+                "vector": torch.tensor(np.stack([o["vector"] for o in obs]), dtype=torch.float32, device=self.device),
+                "window": torch.tensor(np.stack([o["window"] for o in obs]), dtype=torch.float32, device=self.device),
+            }
+            N = obs_t["vector"].shape[0]
+        else:
+            obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device)
+            N = obs_t.shape[0]
+            
         state_t = torch.tensor(state, dtype=torch.float32, device=self.device)
         acts_t = torch.tensor(acts, dtype=torch.int64, device=self.device)
         old_logps_t = torch.tensor(old_logps, dtype=torch.float32, device=self.device)
         advs_t = torch.tensor(advs, dtype=torch.float32, device=self.device)
         rets_t = torch.tensor(rets, dtype=torch.float32, device=self.device)
 
-        N = obs_t.shape[0]
+
         idxs = np.arange(N)
 
         mean_policy_loss = 0.0
@@ -259,7 +330,13 @@ class MAPPO:
             for start in range(0, N, minibatch):
                 mb = idxs[start:start + minibatch]
 
-                mb_obs = obs_t[mb]
+                if self.mode == "hybrid":
+                    mb_obs = {
+                        "vector": obs_t["vector"][mb],
+                        "window": obs_t["window"][mb],
+                    }
+                else:
+                    mb_obs = obs_t[mb]
                 mb_state = state_t[mb]
                 mb_acts = acts_t[mb]
                 mb_old_logps = old_logps_t[mb]
@@ -338,6 +415,11 @@ def train_mappo(
 
     if env.obs_mode == "window":
         obs_spec = sample_obs.shape
+    elif env.obs_mode == "hybrid":
+        obs_spec = {
+            "vector": sample_obs["vector"].shape,
+            "window": sample_obs["window"].shape,
+        }
     else:
         obs_spec = sample_obs.shape[0]
 
@@ -517,7 +599,7 @@ if __name__ == "__main__":
     env = MAPF(
         grid_size=10,
         num_agents=8,
-        obs_mode="knn",  # "vector", "window", "knn"
+        obs_mode="hybrid",  # "vector", "window", "knn", or "hybrid"
         obs_radius=5,
     )
 
