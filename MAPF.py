@@ -216,15 +216,14 @@ class MAPF(ParallelEnv):
         for a in self.agents:
             if self.agent_location[a] == self.goal_locations[a]:
                 rewards[a] += 1.0
+                self._sample_new_goal(a)
 
-        # Termination: everyone on their own goal
-        done = all(self.agent_location[a] == self.goal_locations[a] for a in self.agents)
+        # Only truncate by time (no "all goals reached" terminal condition now)
         truncated = self.timestep >= self.max_steps
-
-        dones = {a: done or truncated for a in self.agents}
+        dones = {a: truncated or truncated for a in self.agents}
         truncs = {a: truncated for a in self.agents}
 
-        if done or truncated:
+        if truncated:
             self.agents = []
 
         return (
@@ -235,6 +234,22 @@ class MAPF(ParallelEnv):
             {a: {} for a in dones},
         )
 
+    def _sample_new_goal(self, agent):
+        """
+        Sample a new goal location for `agent` that doesn't overlap with:
+        - any agent position
+        - any other agent's goal position
+        """
+        occupied = set(self.agent_location[a] for a in self.possible_agents)  # agent cells
+        occupied |= set(self.goal_locations[a] for a in self.possible_agents if a != agent)  # other goals
+
+        # In case grid is super packed, do a bounded retry loop
+        for _ in range(1000):
+            gx = random.randint(0, self.grid_size - 1)
+            gy = random.randint(0, self.grid_size - 1)
+            if (gx, gy) not in occupied:
+                self.goal_locations[agent] = (gx, gy)
+                return
     # ============================================================
     # Movement
     # ============================================================

@@ -516,10 +516,10 @@ if __name__ == "__main__":
 
     env = MAPF(
         grid_size=10,
-        num_agents=4,
+        num_agents=8,
         obs_mode="knn",  # "vector", "window", "knn"
-        obs_radius=3,
+        obs_radius=5,
     )
 
-    algo = train_mappo(env, total_episodes=5000, rollout_len=128, device=device)
+    algo = train_mappo(env, total_episodes=20000, rollout_len=128, device=device)
     torch.save(algo.actor.state_dict(), f"mappo_{env.obs_mode}_actor.pth")
