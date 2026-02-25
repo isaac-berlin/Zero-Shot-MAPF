@@ -35,11 +35,12 @@ def load_actor_for_mode(obs_mode, obs_sample, n_actions, device):
 
 def run_policy(
     actor_path: str,
-    obs_mode: str = "vector",   # "vector", "window", "knn"
+    obs_mode: str = "vector",   # "vector", "window", "knn", "hybrid"
     grid_size=7,
     num_agents=3,
     stochastic=True,            # stochastic (sample) vs argmax
     device="cpu",
+    map_path=None,
 ):
     """
     Unified environment runner for all MAPPO actor types.
@@ -57,6 +58,7 @@ def run_policy(
         grid_size=grid_size,
         num_agents=num_agents,
         obs_mode=obs_mode,
+        map_path=map_path,
     )
 
     agent_order = env.possible_agents[:]
@@ -140,9 +142,10 @@ if __name__ == "__main__":
     # Example usage:
     run_policy(
         actor_path="mappo_knn_actor.pth",  # or mappo_window_actor.pth or mappo_knn_actor.pth
-        obs_mode="knn",                    # "vector", "window", or "knn"
+        obs_mode="knn",                    # "vector", "window", "knn", or "hybrid"
         grid_size=7,
         num_agents=3,
         stochastic=True,
         device=device,
+        map_path="test_map.txt"
     )

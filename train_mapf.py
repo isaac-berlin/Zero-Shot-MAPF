@@ -598,9 +598,10 @@ if __name__ == "__main__":
 
     env = MAPF(
         grid_size=10,
-        num_agents=8,
+        num_agents=2,
         obs_mode="hybrid",  # "vector", "window", "knn", or "hybrid"
         obs_radius=5,
+        map_path="test_map.txt",        # e.g. "maps/example_map.txt"
     )
 
     algo = train_mappo(env, total_episodes=20000, rollout_len=128, device=device)

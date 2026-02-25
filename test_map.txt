@@ -1,0 +1,27 @@
+# Example MAPF map specification (0-indexed coordinates)
+GRID 10
+
+# Block a rectangle (a vertical wall)
+BLOCK_RECT 4 0 4 9
+
+# Add a gap in the wall by un-blocking not supported; instead don't block those cells.
+# So here we "carve" a gap by blocking two smaller rectangles:
+# (This file already blocked full wall above; for a real map, comment that out and use the two lines below.)
+# BLOCK_RECT 4 0 4 3
+# BLOCK_RECT 4 6 4 9
+
+# Individual blocked cells
+BLOCK 2 2
+BLOCK 7 7
+
+# Spawn candidates (need at least num_agents)
+SPAWN 0 0
+SPAWN 0 9
+SPAWN 9 0
+SPAWN 9 9
+
+# Goal candidates (need at least num_agents; must be distinct from chosen spawns)
+GOAL 1 1
+GOAL 1 8
+GOAL 8 1
+GOAL 8 8

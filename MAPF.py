@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Dict, Optional, List, Tuple, Set
 import random
 import numpy as np
 from pettingzoo.utils import ParallelEnv
@@ -42,17 +42,27 @@ class MAPF(ParallelEnv):
         obs_mode="hybrid",    # "vector", "window", "knn", or "hybrid"
         obs_radius=3,         # used only for window mode
         k_agents=2,           # used only for knn mode
+        map_path=None,       # optional path to load map configuration
     ):
 
         assert obs_mode in ("vector", "window", "knn", "hybrid")
         self.obs_mode = obs_mode
+        self.map_path = map_path
 
         self.grid_size = grid_size
         self.n_agents = num_agents
         self.obs_radius = obs_radius
         self.k_agents = k_agents
-        self.max_steps = 200
+        self.max_steps = grid_size * grid_size * 4  # arbitrary large number to prevent infinite episodes
         self.timestep = 0
+        
+        # Map configuration
+        self.blocked: Set[Tuple[int, int]] = set()
+        self.spawn_points: List[Tuple[int, int]] = []
+        self.goal_points: List[Tuple[int, int]] = []
+        
+        if map_path is not None:
+            self._load_map_file(map_path)
 
         # Agents
         self.possible_agents = [f"agent_{i}" for i in range(num_agents)]
@@ -85,6 +95,130 @@ class MAPF(ParallelEnv):
         self._screen = None
         self._clock = None
         self._font = None
+        
+    # ============================================================
+    # Map file parsing
+    # ============================================================
+    def _load_map_file(self, path: str) -> None:
+        """
+        Load a text map specification.
+
+        Supported directives (case-insensitive), one per line:
+
+            GRID <N>
+                - sets grid size to N (optional; overrides constructor arg)
+
+            BLOCK <x> <y>
+                - marks a single blocked cell
+
+            BLOCK_RECT <x1> <y1> <x2> <y2>
+                - marks a rectangle of blocked cells (inclusive)
+
+            SPAWN <x> <y>
+                - adds a candidate spawn location
+
+            GOAL <x> <y>
+                - adds a candidate goal location
+
+        Notes:
+        - Coordinates are 0-indexed and use the same (x, y) convention as the env.
+        - Lines starting with '#' or empty lines are ignored.
+        """
+        blocked: Set[Tuple[int, int]] = set()
+        spawns: List[Tuple[int, int]] = []
+        goals: List[Tuple[int, int]] = []
+
+        with open(path, "r", encoding="utf-8") as f:
+            for lineno, raw in enumerate(f, start=1):
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+
+                parts = line.split()
+                key = parts[0].upper()
+
+                def parse_ints(n: int) -> List[int]:
+                    if len(parts) != n + 1:
+                        raise ValueError(f"{path}:{lineno}: expected {n} ints after {parts[0]!r}, got: {parts[1:]}")
+                    try:
+                        return [int(v) for v in parts[1:]]
+                    except ValueError as e:
+                        raise ValueError(f"{path}:{lineno}: non-integer value in: {parts}") from e
+
+                if key == "GRID":
+                    (n,) = parse_ints(1)
+                    if n <= 1:
+                        raise ValueError(f"{path}:{lineno}: GRID must be > 1")
+                    self.grid_size = n
+
+                elif key == "BLOCK":
+                    x, y = parse_ints(2)
+                    blocked.add((x, y))
+
+                elif key == "BLOCK_RECT":
+                    x1, y1, x2, y2 = parse_ints(4)
+                    xa, xb = sorted((x1, x2))
+                    ya, yb = sorted((y1, y2))
+                    for x in range(xa, xb + 1):
+                        for y in range(ya, yb + 1):
+                            blocked.add((x, y))
+
+                elif key == "SPAWN":
+                    x, y = parse_ints(2)
+                    spawns.append((x, y))
+
+                elif key == "GOAL":
+                    x, y = parse_ints(2)
+                    goals.append((x, y))
+
+                else:
+                    raise ValueError(f"{path}:{lineno}: unknown directive {parts[0]!r}")
+
+
+        def in_bounds(p: Tuple[int, int]) -> bool:
+            x, y = p
+            return 0 <= x < self.grid_size and 0 <= y < self.grid_size
+
+        # Bounds + consistency checks
+        for p in blocked:
+            if not in_bounds(p):
+                raise ValueError(f"{path}: blocked cell out of bounds: {p} for GRID {self.grid_size}")
+        for p in spawns:
+            if not in_bounds(p):
+                raise ValueError(f"{path}: spawn out of bounds: {p} for GRID {self.grid_size}")
+            if p in blocked:
+                raise ValueError(f"{path}: spawn on blocked cell: {p}")
+        for p in goals:
+            if not in_bounds(p):
+                raise ValueError(f"{path}: goal out of bounds: {p} for GRID {self.grid_size}")
+            if p in blocked:
+                raise ValueError(f"{path}: goal on blocked cell: {p}")
+
+        self.blocked = set(blocked)
+        # de-duplicate while preserving order
+        def dedup(seq):
+            seen=set()
+            out=[]
+            for item in seq:
+                if item not in seen:
+                    seen.add(item); out.append(item)
+            return out
+        self.spawn_points = dedup(spawns)
+        self.goal_points = dedup(goals)
+
+    def _random_free_cell(self, occupied: Set[Tuple[int, int]]) -> Tuple[int, int]:
+        """Random free (non-blocked) cell not in occupied."""
+        for _ in range(2000):
+            p = (random.randint(0, self.grid_size - 1), random.randint(0, self.grid_size - 1))
+            if p not in self.blocked and p not in occupied:
+                return p
+        # fallback: brute force search
+        for x in range(self.grid_size):
+            for y in range(self.grid_size):
+                p = (x, y)
+                if p not in self.blocked and p not in occupied:
+                    return p
+        raise RuntimeError("No free cells available (grid may be fully blocked/occupied).")
 
     # ============================================================
     # Spaces
@@ -133,29 +267,58 @@ class MAPF(ParallelEnv):
         for a in self.agents:
             self.agent_dir[a] = random.randint(0, 3)
 
-        # randomly place agents and their goals (distinct positions)
-        needed = self.n_agents * 2
-        positions = set()
-        while len(positions) < needed:
-            positions.add(
-                (random.randint(0, self.grid_size - 1),
-                 random.randint(0, self.grid_size - 1))
-            )
+        # place agents and their goals
+        # Priority:
+        #   - if spawn_points / goal_points are provided via map file, sample from those sets
+        #   - otherwise fall back to uniform random sampling over free cells
 
-        positions = list(positions)
-        idx = 0
+        # -----------------------------
+        # Choose spawn locations
+        # -----------------------------
+        occupied: Set[Tuple[int, int]] = set()
 
-        # Goals (one per agent)
-        for agent in self.agents:
-            self.goal_locations[agent] = positions[idx]
-            idx += 1
+        if self.spawn_points:
+            if len(self.spawn_points) < self.n_agents:
+                raise ValueError(
+                    f"Not enough SPAWN points for {self.n_agents} agents (have {len(self.spawn_points)})."
+                )
+            spawns = random.sample(self.spawn_points, self.n_agents)
+        else:
+            spawns = []
+            for _ in range(self.n_agents):
+                p = self._random_free_cell(occupied)
+                spawns.append(p)
+                occupied.add(p)
 
-        # Agents
-        for agent in self.agents:
-            self.agent_location[agent] = positions[idx]
-            idx += 1
+        # mark occupied by spawns
+        occupied |= set(spawns)
+
+        # -----------------------------
+        # Choose goal locations
+        # -----------------------------
+        if self.goal_points:
+            # avoid picking a goal that collides with any spawn
+            candidates = [p for p in self.goal_points if p not in occupied]
+            if len(candidates) < self.n_agents:
+                raise ValueError(
+                    f"Not enough GOAL points that are distinct from chosen spawns "
+                    f"for {self.n_agents} agents (need {self.n_agents}, have {len(candidates)})."
+                )
+            goals = random.sample(candidates, self.n_agents)
+        else:
+            goals = []
+            for _ in range(self.n_agents):
+                p = self._random_free_cell(occupied)
+                goals.append(p)
+                occupied.add(p)
+
+        # Assign per-agent
+        for i, agent in enumerate(self.agents):
+            self.goal_locations[agent] = goals[i]
+            self.agent_location[agent] = spawns[i]
 
         return self._get_observations(), {a: {} for a in self.agents}
+
 
     # ============================================================
     # Step
@@ -247,17 +410,23 @@ class MAPF(ParallelEnv):
         Sample a new goal location for `agent` that doesn't overlap with:
         - any agent position
         - any other agent's goal position
+        - any blocked cell
+
+        If goal points were provided in a map file, sample from that set.
+        Otherwise, sample uniformly at random over free cells.
         """
         occupied = set(self.agent_location[a] for a in self.possible_agents)  # agent cells
         occupied |= set(self.goal_locations[a] for a in self.possible_agents if a != agent)  # other goals
+        occupied |= set(self.blocked)
 
-        # In case grid is super packed, do a bounded retry loop
-        for _ in range(1000):
-            gx = random.randint(0, self.grid_size - 1)
-            gy = random.randint(0, self.grid_size - 1)
-            if (gx, gy) not in occupied:
-                self.goal_locations[agent] = (gx, gy)
+        if self.goal_points:
+            candidates = [p for p in self.goal_points if p not in occupied]
+            if candidates:
+                self.goal_locations[agent] = random.choice(candidates)
                 return
+            # fall through to random if candidates exhausted
+
+        self.goal_locations[agent] = self._random_free_cell(occupied)
     # ============================================================
     # Movement
     # ============================================================
@@ -272,7 +441,12 @@ class MAPF(ParallelEnv):
             y = max(0, y - 1)
         elif heading == 3:
             x = max(0, x - 1)
-        return (x, y)
+            
+        cand = (x, y)
+        # blocked cells are impassable: treat as "bump into wall" (stay put)
+        if cand in self.blocked:
+            return loc
+        return cand
 
     # ============================================================
     # Observation dispatcher
@@ -332,7 +506,12 @@ class MAPF(ParallelEnv):
             for dy in range(-R, R + 1):
                 wx, wy = ax + dx, ay + dy
                 if in_bounds(wx, wy):
-                    obs[R + dx, R + dy, :] = 0.0
+                    if (wx, wy) in self.blocked:
+                        obs[R + dx, R + dy, 0] = -1.0  # obstacle
+                        obs[R + dx, R + dy, 1] = 0.0
+                        obs[R + dx, R + dy, 2] = 0.0
+                    else:
+                        obs[R + dx, R + dy, :] = 0.0
 
         # ego (channel 0 encodes heading at center cell)
         # heading: 0=N,1=E,2=S,3=W -> 0.25,0.5,0.75,1.0
