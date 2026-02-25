@@ -645,6 +645,16 @@ class MAPF(ParallelEnv):
                     pygame.Rect(sx, sy, self._cell_size, self._cell_size),
                     1,
                 )
+            # blocked cells (draw AFTER grid lines, BEFORE goals/agents)
+        for (bx, by) in self.blocked:
+            sx, sy = self._grid_to_screen(bx, by)
+            rect = pygame.Rect(sx, sy, self._cell_size, self._cell_size)
+
+            # fill
+            pygame.draw.rect(self._screen, (20, 20, 20), rect)
+
+            # outline for readability
+            pygame.draw.rect(self._screen, (110, 110, 110), rect, 2)
 
         # goals (each goal matches its agent's color)
         for agent in self.possible_agents:
