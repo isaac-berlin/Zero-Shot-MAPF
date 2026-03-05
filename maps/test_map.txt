@@ -1,5 +1,5 @@
 # Example MAPF map specification (0-indexed coordinates)
-GRID 10
+GRID 10 8
 
 # Block a rectangle (a vertical wall)
 BLOCK_RECT 4 0 4 9

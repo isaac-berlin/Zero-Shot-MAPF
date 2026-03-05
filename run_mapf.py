@@ -36,7 +36,7 @@ def load_actor_for_mode(obs_mode, obs_sample, n_actions, device):
 def run_policy(
     actor_path: str,
     obs_mode: str = "vector",   # "vector", "window", "knn", "hybrid"
-    grid_size=7,
+    grid_shape=(7, 7),
     num_agents=3,
     stochastic=True,            # stochastic (sample) vs argmax
     device="cpu",
@@ -55,7 +55,7 @@ def run_policy(
     # Create MAPF env
     # -----------------------------
     env = MAPF(
-        grid_size=grid_size,
+        grid_shape=grid_shape,
         num_agents=num_agents,
         obs_mode=obs_mode,
         map_path=map_path,
@@ -143,7 +143,7 @@ if __name__ == "__main__":
     run_policy(
         actor_path="mappo_knn_actor.pth",  # or mappo_window_actor.pth or mappo_knn_actor.pth
         obs_mode="knn",                    # "vector", "window", "knn", or "hybrid"
-        grid_size=7,
+        grid_shape=(7, 7),
         num_agents=3,
         stochastic=True,
         device=device,

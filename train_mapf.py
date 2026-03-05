@@ -506,7 +506,7 @@ def train_mappo(
             if all(dones.values()) or all(truncs.values()):
                 # coverage
                 unique_cells_visited = len(visited)
-                coverage_fraction = unique_cells_visited / (env.grid_size * env.grid_size)
+                coverage_fraction = unique_cells_visited / (env.grid_w * env.grid_h)
 
                 # mean pairwise distance
                 pair_dists = []
@@ -597,7 +597,7 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     env = MAPF(
-        grid_size=10,
+        grid_shape=(10, 8),
         num_agents=2,
         obs_mode="hybrid",  # "vector", "window", "knn", or "hybrid"
         obs_radius=5,

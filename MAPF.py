@@ -37,7 +37,7 @@ class MAPF(ParallelEnv):
 
     def __init__(
         self,
-        grid_size=7,
+        grid_shape=(7, 7),
         num_agents=2,
         obs_mode="hybrid",    # "vector", "window", "knn", or "hybrid"
         obs_radius=3,         # used only for window mode
@@ -49,11 +49,13 @@ class MAPF(ParallelEnv):
         self.obs_mode = obs_mode
         self.map_path = map_path
 
-        self.grid_size = grid_size
+        self.grid_h = grid_shape[0]
+        self.grid_w = grid_shape[1]
+        
         self.n_agents = num_agents
         self.obs_radius = obs_radius
         self.k_agents = k_agents
-        self.max_steps = grid_size * grid_size * 4  # arbitrary large number to prevent infinite episodes
+        self.max_steps = self.grid_h * self.grid_w * 4  # arbitrary large number to prevent infinite episodes
         self.timestep = 0
         
         # Map configuration
@@ -90,8 +92,17 @@ class MAPF(ParallelEnv):
         # Rendering
         self.render_mode = "human"
         self._pygame_initialized = False
-        self._cell_size = 64
-        self._margin = 40
+        
+        # Rendering sizing limits (tweak as you like)
+        self._max_window_w = 2000 
+        self._max_window_h = 1500
+        self._min_cell_size = 2
+        self._max_cell_size = 64
+
+        # Default; will be overwritten dynamically in _init_pygame()
+        self._cell_size = 32
+        self._margin = 20
+        
         self._screen = None
         self._clock = None
         self._font = None
@@ -105,8 +116,8 @@ class MAPF(ParallelEnv):
 
         Supported directives (case-insensitive), one per line:
 
-            GRID <N>
-                - sets grid size to N (optional; overrides constructor arg)
+            GRID <H> <W>
+                - sets grid shape to (H, W) (optional; overrides constructor arg)
 
             BLOCK <x> <y>
                 - marks a single blocked cell
@@ -146,10 +157,11 @@ class MAPF(ParallelEnv):
                         raise ValueError(f"{path}:{lineno}: non-integer value in: {parts}") from e
 
                 if key == "GRID":
-                    (n,) = parse_ints(1)
-                    if n <= 1:
-                        raise ValueError(f"{path}:{lineno}: GRID must be > 1")
-                    self.grid_size = n
+                    h, w = parse_ints(2)
+                    if h <= 1 or w <= 1:
+                        raise ValueError(f"{path}:{lineno}: GRID dimensions must be > 1")
+                    self.grid_h = h
+                    self.grid_w = w
 
                 elif key == "BLOCK":
                     x, y = parse_ints(2)
@@ -177,20 +189,20 @@ class MAPF(ParallelEnv):
 
         def in_bounds(p: Tuple[int, int]) -> bool:
             x, y = p
-            return 0 <= x < self.grid_size and 0 <= y < self.grid_size
+            return 0 <= x < self.grid_w and 0 <= y < self.grid_h
 
         # Bounds + consistency checks
         for p in blocked:
             if not in_bounds(p):
-                raise ValueError(f"{path}: blocked cell out of bounds: {p} for GRID {self.grid_size}")
+                raise ValueError(f"{path}: blocked cell out of bounds: {p} for GRID {self.grid_h}x{self.grid_w}")
         for p in spawns:
             if not in_bounds(p):
-                raise ValueError(f"{path}: spawn out of bounds: {p} for GRID {self.grid_size}")
+                raise ValueError(f"{path}: spawn out of bounds: {p} for GRID {self.grid_h}x{self.grid_w}")
             if p in blocked:
                 raise ValueError(f"{path}: spawn on blocked cell: {p}")
         for p in goals:
             if not in_bounds(p):
-                raise ValueError(f"{path}: goal out of bounds: {p} for GRID {self.grid_size}")
+                raise ValueError(f"{path}: goal out of bounds: {p} for GRID {self.grid_h}x{self.grid_w}")
             if p in blocked:
                 raise ValueError(f"{path}: goal on blocked cell: {p}")
 
@@ -209,12 +221,12 @@ class MAPF(ParallelEnv):
     def _random_free_cell(self, occupied: Set[Tuple[int, int]]) -> Tuple[int, int]:
         """Random free (non-blocked) cell not in occupied."""
         for _ in range(2000):
-            p = (random.randint(0, self.grid_size - 1), random.randint(0, self.grid_size - 1))
+            p = (random.randint(0, self.grid_w - 1), random.randint(0, self.grid_h - 1))
             if p not in self.blocked and p not in occupied:
                 return p
         # fallback: brute force search
-        for x in range(self.grid_size):
-            for y in range(self.grid_size):
+        for x in range(self.grid_w):
+            for y in range(self.grid_h):
                 p = (x, y)
                 if p not in self.blocked and p not in occupied:
                     return p
@@ -434,9 +446,9 @@ class MAPF(ParallelEnv):
         x, y = loc
         # 0=N,1=E,2=S,3=W
         if heading == 0:
-            y = min(self.grid_size - 1, y + 1)
+            y = min(self.grid_h - 1, y + 1)
         elif heading == 1:
-            x = min(self.grid_size - 1, x + 1)
+            x = min(self.grid_w - 1, x + 1)
         elif heading == 2:
             y = max(0, y - 1)
         elif heading == 3:
@@ -499,7 +511,7 @@ class MAPF(ParallelEnv):
         obs = np.full((W, W, 3), -1.0, dtype=np.float32)
 
         def in_bounds(x, y):
-            return 0 <= x < self.grid_size and 0 <= y < self.grid_size
+            return 0 <= x < self.grid_w and 0 <= y < self.grid_h
 
         # empty cells
         for dx in range(-R, R + 1):
@@ -636,8 +648,8 @@ class MAPF(ParallelEnv):
         self._screen.fill((30, 30, 30))
 
         # grid
-        for x in range(self.grid_size):
-            for y in range(self.grid_size):
+        for x in range(self.grid_w):
+            for y in range(self.grid_h):
                 sx, sy = self._grid_to_screen(x, y)
                 pygame.draw.rect(
                     self._screen,
@@ -711,19 +723,51 @@ class MAPF(ParallelEnv):
             return
         pygame.init()
 
-        width = self.grid_size * self._cell_size + 2 * self._margin
-        height = self.grid_size * self._cell_size + 2 * self._margin
-        self._screen = pygame.display.set_mode((width, height))
-
+        width = self.grid_w * self._cell_size + 2 * self._margin
+        height = self.grid_h * self._cell_size + 2 * self._margin
+        # If still too large for some reason, shrink further (safety loop)
+        while (width > self._max_window_w or height > self._max_window_h) and self._cell_size > self._min_cell_size:
+            self._cell_size -= 1
+            self._margin = int(max(8, min(40, self._cell_size * 0.6)))
+            width = self.grid_w * self._cell_size + 2 * self._margin
+            height = self.grid_h * self._cell_size + 2 * self._margin
+            
+        self._screen = pygame.display.set_mode((int(width), int(height)))
         self._clock = pygame.time.Clock()
-        self._font = pygame.font.SysFont("consolas", 18)
+        
+        font_size = int(max(12, min(24, self._cell_size * 0.6)))
+        self._font = pygame.font.SysFont("consolas", font_size)
         self._pygame_initialized = True
 
     def _grid_to_screen(self, x, y):
         return (
             self._margin + x * self._cell_size,
-            self._margin + (self.grid_size - 1 - y) * self._cell_size,
+            self._margin + (self.grid_h - 1 - y) * self._cell_size,
         )
+        
+    def _compute_render_scale(self):
+        """
+        Choose cell size + margin so the grid fits on screen.
+
+        Uses self.grid_w, self.grid_h and clamps cell size into
+        [self._min_cell_size, self._max_cell_size].
+        """
+        # leave room for margin on both sides
+        avail_w = max(50, self._max_window_w - 2 * self._margin)
+        avail_h = max(50, self._max_window_h - 2 * self._margin)
+
+        # compute cell size that fits (floor)
+        cell_w = avail_w // self.grid_w
+        cell_h = avail_h // self.grid_h
+        cell = int(min(cell_w, cell_h))
+
+        # clamp
+        cell = max(self._min_cell_size, min(self._max_cell_size, cell))
+
+        # margin scales a bit with cell size (but keep reasonable)
+        margin = int(max(8, min(40, cell * 0.6)))
+
+        return cell, margin
 
     def close(self):
         if self._pygame_initialized:
@@ -732,7 +776,8 @@ class MAPF(ParallelEnv):
 
 
 if __name__ == "__main__":
-    env = MAPF(grid_size=10, num_agents=4, obs_mode="vector")
+    #env = MAPF(grid_shape=(10, 8), num_agents=4, obs_mode="vector")
+    env = MAPF(num_agents=500, obs_mode="hybrid", map_path="maps/Paris_1_256.craft.txt")
     obs, info = env.reset()
     done = {a: False for a in env.agents}
 
