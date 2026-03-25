@@ -1,4 +1,7 @@
 from typing import Dict, Optional, List, Tuple, Set
+import json
+import os
+import re
 import random
 import numpy as np
 from pettingzoo.utils import ParallelEnv
@@ -38,11 +41,11 @@ class MAPF(ParallelEnv):
     def __init__(
         self,
         grid_shape=(7, 7),
-        num_agents=2,
+        num_agents: Optional[int] = None,
         obs_mode="hybrid",    # "vector", "window", "knn", or "hybrid"
         obs_radius=3,         # used only for window mode
         k_agents=2,           # used only for knn mode
-        map_path=None,       # optional path to load map configuration
+        map_path=None,       # optional .json config or .domain directory
     ):
 
         assert obs_mode in ("vector", "window", "knn", "hybrid")
@@ -52,11 +55,19 @@ class MAPF(ParallelEnv):
         self.grid_h = grid_shape[0]
         self.grid_w = grid_shape[1]
         
-        self.n_agents = num_agents
+        self.n_agents = int(num_agents) if num_agents is not None else 2
         self.obs_radius = obs_radius
         self.k_agents = k_agents
         self.max_steps = self.grid_h * self.grid_w * 4  # arbitrary large number to prevent infinite episodes
         self.timestep = 0
+        self._using_domain_config = False
+
+        # Optional metadata loaded from benchmark JSON configs.
+        self.team_size: Optional[int] = None
+        self.num_tasks_reveal: Optional[float] = None
+        self.agent_size: Optional[float] = None
+        self.max_counter: Optional[int] = None
+        self.delay_config: Dict = {}
         
         # Map configuration
         self.blocked: Set[Tuple[int, int]] = set()
@@ -65,9 +76,13 @@ class MAPF(ParallelEnv):
         
         if map_path is not None:
             self._load_map_file(map_path)
+            if num_agents is None and self.team_size is not None:
+                self.n_agents = self.team_size
+            # Grid size may have changed after loading config.
+            self.max_steps = self.grid_h * self.grid_w * 4
 
         # Agents
-        self.possible_agents = [f"agent_{i}" for i in range(num_agents)]
+        self.possible_agents = [f"agent_{i}" for i in range(self.n_agents)]
         self.agents = self.possible_agents[:]
         self.agent_location = {a: (0, 0) for a in self.agents}
 
@@ -111,6 +126,291 @@ class MAPF(ParallelEnv):
     # Map file parsing
     # ============================================================
     def _load_map_file(self, path: str) -> None:
+        """
+        Load either:
+        - .domain directory containing one or more benchmark JSON configs,
+        - benchmark JSON config (.json) that points to .map/.agents/.tasks files, or
+        - legacy text directive format.
+        """
+        resolved_path = path
+        norm = os.path.normpath(path)
+        if os.path.isdir(norm) or norm.lower().endswith(".domain"):
+            resolved_path = self._resolve_domain_config_json(norm)
+
+        if resolved_path.lower().endswith(".json"):
+            self._load_benchmark_json(resolved_path)
+        else:
+            self._load_legacy_map_file(resolved_path)
+
+    def _resolve_domain_config_json(self, domain_dir: str) -> str:
+        """
+        Resolve a .domain directory into a concrete benchmark JSON config file.
+
+        Selection strategy:
+        - if only one JSON exists: use it
+        - if multiple JSON files exist and num_agents is provided: prefer exact teamSize,
+          otherwise the smallest teamSize >= num_agents, otherwise the largest teamSize
+        - if no teamSize metadata can be used: pick lexicographically first file
+        """
+        if not os.path.isdir(domain_dir):
+            raise ValueError(f"{domain_dir}: expected an existing .domain directory.")
+
+        json_candidates = [
+            os.path.join(domain_dir, name)
+            for name in os.listdir(domain_dir)
+            if name.lower().endswith(".json")
+        ]
+        json_candidates.sort()
+
+        if not json_candidates:
+            raise ValueError(f"{domain_dir}: no JSON scenario files found in .domain directory.")
+        if len(json_candidates) == 1:
+            return json_candidates[0]
+
+        # Try selecting by teamSize when multiple scenarios are present.
+        annotated: List[Tuple[str, Optional[int]]] = []
+        for cfg_path in json_candidates:
+            team_size = None
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                if "teamSize" in cfg:
+                    team_size = int(cfg["teamSize"])
+            except Exception:
+                team_size = None
+            annotated.append((cfg_path, team_size))
+
+        if self.n_agents is not None:
+            exact = [p for (p, ts) in annotated if ts == self.n_agents]
+            if exact:
+                return sorted(exact)[0]
+
+            larger_or_equal = sorted(
+                [(p, ts) for (p, ts) in annotated if ts is not None and ts >= self.n_agents],
+                key=lambda item: (item[1], item[0]),
+            )
+            if larger_or_equal:
+                return larger_or_equal[0][0]
+
+            known_sizes = sorted(
+                [(p, ts) for (p, ts) in annotated if ts is not None],
+                key=lambda item: (item[1], item[0]),
+            )
+            if known_sizes:
+                return known_sizes[-1][0]
+
+        return annotated[0][0]
+
+    def _load_benchmark_json(self, path: str) -> None:
+        """Load benchmark-style config with mapFile/agentFile/taskFile fields."""
+        self._using_domain_config = True
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+
+        base_dir = os.path.dirname(path)
+
+        def resolve_rel(rel_path: str) -> str:
+            return os.path.normpath(os.path.join(base_dir, rel_path))
+
+        try:
+            map_file = resolve_rel(cfg["mapFile"])
+            agent_file = resolve_rel(cfg["agentFile"])
+            task_file = resolve_rel(cfg["taskFile"])
+        except KeyError as e:
+            raise ValueError(f"{path}: missing required key {e.args[0]!r}") from e
+
+        width, height, blocked = self._parse_octile_map_file(map_file)
+        self.grid_w = width
+        self.grid_h = height
+        self.blocked = blocked
+
+        self.spawn_points = self._parse_agents_file(agent_file)
+        self.goal_points = self._parse_tasks_file(task_file)
+
+        if "teamSize" in cfg:
+            self.team_size = int(cfg["teamSize"])
+        if "numTasksReveal" in cfg:
+            self.num_tasks_reveal = float(cfg["numTasksReveal"])
+        if "agentSize" in cfg:
+            self.agent_size = float(cfg["agentSize"])
+        # Some files use "agentCounter" while docs call it "maxCounter".
+        if "maxCounter" in cfg:
+            self.max_counter = int(cfg["maxCounter"])
+        elif "agentCounter" in cfg:
+            self.max_counter = int(cfg["agentCounter"])
+
+        delay_cfg = cfg.get("delayConfig", {})
+        if isinstance(delay_cfg, str):
+            delay_path = resolve_rel(delay_cfg)
+            with open(delay_path, "r", encoding="utf-8") as f:
+                self.delay_config = json.load(f)
+        elif isinstance(delay_cfg, dict):
+            self.delay_config = delay_cfg
+        else:
+            raise ValueError(f"{path}: delayConfig must be an object or relative json path.")
+
+        self._validate_points(path, self.blocked, self.spawn_points, self.goal_points)
+        self.spawn_points = self._dedup_points(self.spawn_points)
+        self.goal_points = self._dedup_points(self.goal_points)
+
+    def _parse_octile_map_file(self, path: str) -> Tuple[int, int, Set[Tuple[int, int]]]:
+        """
+        Parse a map in movingai "octile" text format and return (width, height, blocked).
+
+        Coordinates are converted into this env's (x, y) with y growing upward.
+        """
+        with open(path, "r", encoding="utf-8") as f:
+            raw_lines = [line.rstrip("\n") for line in f]
+
+        if len(raw_lines) < 4:
+            raise ValueError(f"{path}: invalid map file, expected at least 4 header lines.")
+
+        height = None
+        width = None
+        map_start = None
+
+        for i, line in enumerate(raw_lines):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            lower = stripped.lower()
+            if lower.startswith("height"):
+                parts = stripped.split()
+                if len(parts) < 2:
+                    raise ValueError(f"{path}:{i + 1}: malformed height line.")
+                height = int(parts[1])
+            elif lower.startswith("width"):
+                parts = stripped.split()
+                if len(parts) < 2:
+                    raise ValueError(f"{path}:{i + 1}: malformed width line.")
+                width = int(parts[1])
+            elif lower == "map":
+                map_start = i + 1
+                break
+
+        if height is None or width is None or map_start is None:
+            raise ValueError(f"{path}: expected header fields: height, width, and map.")
+        if height <= 1 or width <= 1:
+            raise ValueError(f"{path}: height and width must be > 1.")
+
+        if len(raw_lines) < map_start + height:
+            raise ValueError(f"{path}: expected {height} map rows, got fewer.")
+
+        blocked: Set[Tuple[int, int]] = set()
+        obstacle_symbols = {"@", "T"}
+
+        for row in range(height):
+            map_row = raw_lines[map_start + row]
+            if len(map_row) < width:
+                raise ValueError(
+                    f"{path}:{map_start + row + 1}: map row too short (expected {width}, got {len(map_row)})."
+                )
+            y = height - 1 - row
+            for x, symbol in enumerate(map_row[:width]):
+                if symbol in obstacle_symbols:
+                    blocked.add((x, y))
+
+        return width, height, blocked
+
+    def _linear_to_xy(self, loc: int, width: int, height: int, source: str) -> Tuple[int, int]:
+        if loc < 0:
+            raise ValueError(f"{source}: negative location index {loc}.")
+        row = loc // width
+        col = loc % width
+        if row >= height:
+            raise ValueError(f"{source}: location index {loc} is out of bounds for {height}x{width}.")
+        # Input row increases downward; env y increases upward.
+        return col, (height - 1 - row)
+
+    def _parse_agents_file(self, path: str) -> List[Tuple[int, int]]:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+
+        if not lines:
+            raise ValueError(f"{path}: empty agents file.")
+
+        try:
+            n_agents = int(lines[0])
+        except ValueError as e:
+            raise ValueError(f"{path}: first non-comment line must be integer agent count.") from e
+
+        if len(lines) < 1 + n_agents:
+            raise ValueError(f"{path}: expected {n_agents} agent locations, found {len(lines) - 1}.")
+
+        starts: List[Tuple[int, int]] = []
+        for i in range(n_agents):
+            line = lines[1 + i]
+            nums = re.findall(r"-?\d+", line)
+            if not nums:
+                raise ValueError(f"{path}:{i + 2}: missing location index.")
+            loc = int(nums[0])
+            starts.append(self._linear_to_xy(loc, self.grid_w, self.grid_h, f"{path}:{i + 2}"))
+
+        return starts
+
+    def _parse_tasks_file(self, path: str) -> List[Tuple[int, int]]:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+
+        if not lines:
+            raise ValueError(f"{path}: empty tasks file.")
+
+        try:
+            n_tasks = int(lines[0])
+        except ValueError as e:
+            raise ValueError(f"{path}: first non-comment line must be integer task count.") from e
+
+        if len(lines) < 1 + n_tasks:
+            raise ValueError(f"{path}: expected {n_tasks} task lines, found {len(lines) - 1}.")
+
+        points: List[Tuple[int, int]] = []
+        for i in range(n_tasks):
+            line = lines[1 + i]
+            nums = re.findall(r"-?\d+", line)
+            if not nums:
+                raise ValueError(f"{path}:{i + 2}: task line has no locations.")
+            for token in nums:
+                loc = int(token)
+                points.append(self._linear_to_xy(loc, self.grid_w, self.grid_h, f"{path}:{i + 2}"))
+
+        return points
+
+    @staticmethod
+    def _dedup_points(seq: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        seen = set()
+        out = []
+        for item in seq:
+            if item not in seen:
+                seen.add(item)
+                out.append(item)
+        return out
+
+    def _validate_points(
+        self,
+        source: str,
+        blocked: Set[Tuple[int, int]],
+        spawns: List[Tuple[int, int]],
+        goals: List[Tuple[int, int]],
+    ) -> None:
+        def in_bounds(p: Tuple[int, int]) -> bool:
+            x, y = p
+            return 0 <= x < self.grid_w and 0 <= y < self.grid_h
+
+        for p in blocked:
+            if not in_bounds(p):
+                raise ValueError(f"{source}: blocked cell out of bounds: {p} for GRID {self.grid_h}x{self.grid_w}")
+        for p in spawns:
+            if not in_bounds(p):
+                raise ValueError(f"{source}: spawn out of bounds: {p} for GRID {self.grid_h}x{self.grid_w}")
+            if p in blocked:
+                raise ValueError(f"{source}: spawn on blocked cell: {p}")
+        for p in goals:
+            if not in_bounds(p):
+                raise ValueError(f"{source}: goal out of bounds: {p} for GRID {self.grid_h}x{self.grid_w}")
+            if p in blocked:
+                raise ValueError(f"{source}: goal on blocked cell: {p}")
+
+    def _load_legacy_map_file(self, path: str) -> None:
         """
         Load a text map specification.
 
@@ -186,37 +486,11 @@ class MAPF(ParallelEnv):
                 else:
                     raise ValueError(f"{path}:{lineno}: unknown directive {parts[0]!r}")
 
-
-        def in_bounds(p: Tuple[int, int]) -> bool:
-            x, y = p
-            return 0 <= x < self.grid_w and 0 <= y < self.grid_h
-
-        # Bounds + consistency checks
-        for p in blocked:
-            if not in_bounds(p):
-                raise ValueError(f"{path}: blocked cell out of bounds: {p} for GRID {self.grid_h}x{self.grid_w}")
-        for p in spawns:
-            if not in_bounds(p):
-                raise ValueError(f"{path}: spawn out of bounds: {p} for GRID {self.grid_h}x{self.grid_w}")
-            if p in blocked:
-                raise ValueError(f"{path}: spawn on blocked cell: {p}")
-        for p in goals:
-            if not in_bounds(p):
-                raise ValueError(f"{path}: goal out of bounds: {p} for GRID {self.grid_h}x{self.grid_w}")
-            if p in blocked:
-                raise ValueError(f"{path}: goal on blocked cell: {p}")
+        self._validate_points(path, blocked, spawns, goals)
 
         self.blocked = set(blocked)
-        # de-duplicate while preserving order
-        def dedup(seq):
-            seen=set()
-            out=[]
-            for item in seq:
-                if item not in seen:
-                    seen.add(item); out.append(item)
-            return out
-        self.spawn_points = dedup(spawns)
-        self.goal_points = dedup(goals)
+        self.spawn_points = self._dedup_points(spawns)
+        self.goal_points = self._dedup_points(goals)
 
     def _random_free_cell(self, occupied: Set[Tuple[int, int]]) -> Tuple[int, int]:
         """Random free (non-blocked) cell not in occupied."""
@@ -294,7 +568,11 @@ class MAPF(ParallelEnv):
                 raise ValueError(
                     f"Not enough SPAWN points for {self.n_agents} agents (have {len(self.spawn_points)})."
                 )
-            spawns = random.sample(self.spawn_points, self.n_agents)
+            if self._using_domain_config:
+                # Domain configs already provide explicit starts in agentFile.
+                spawns = self.spawn_points[:self.n_agents]
+            else:
+                spawns = random.sample(self.spawn_points, self.n_agents)
         else:
             spawns = []
             for _ in range(self.n_agents):
@@ -316,7 +594,11 @@ class MAPF(ParallelEnv):
                     f"Not enough GOAL points that are distinct from chosen spawns "
                     f"for {self.n_agents} agents (need {self.n_agents}, have {len(candidates)})."
                 )
-            goals = random.sample(candidates, self.n_agents)
+            if self._using_domain_config:
+                # Domain taskFile defines the target pool; preserve file order.
+                goals = candidates[:self.n_agents]
+            else:
+                goals = random.sample(candidates, self.n_agents)
         else:
             goals = []
             for _ in range(self.n_agents):
@@ -668,42 +950,58 @@ class MAPF(ParallelEnv):
             # outline for readability
             pygame.draw.rect(self._screen, (110, 110, 110), rect, 2)
 
-        # goals (each goal matches its agent's color)
+        # goals/targets: orange squares with agent number
         for agent in self.possible_agents:
             gx, gy = self.goal_locations[agent]
             sx, sy = self._grid_to_screen(gx, gy)
-            color = self._agent_color(agent)
-            pygame.draw.circle(
-                self._screen,
-                color,
-                (sx + self._cell_size // 2, sy + self._cell_size // 2),
-                self._cell_size // 4,
-            )
-            # optional outline for readability
-            pygame.draw.circle(
-                self._screen,
-                (10, 10, 10),
-                (sx + self._cell_size // 2, sy + self._cell_size // 2),
-                self._cell_size // 4,
-                2,
-            )
+            goal_color = (255, 140, 0)  # orange
 
-        # agents (arrows pointing in heading, using same per-agent color)
+            pad = max(1, self._cell_size // 6)
+            goal_rect = pygame.Rect(
+                sx + pad,
+                sy + pad,
+                self._cell_size - 2 * pad,
+                self._cell_size - 2 * pad,
+            )
+            pygame.draw.rect(self._screen, goal_color, goal_rect)
+            pygame.draw.rect(self._screen, (20, 20, 20), goal_rect, 2)
+
+            agent_num = agent.split("_")[-1] if "_" in agent else "?"
+            goal_label = self._font.render(agent_num, True, (160, 160, 160))
+            gl_rect = goal_label.get_rect(center=(goal_rect.centerx, goal_rect.centery))
+            self._screen.blit(goal_label, gl_rect)
+
+        # agents: blue circles with heading dot and number
         for agent in self.agents:
             ax, ay = self.agent_location[agent]
             sx, sy = self._grid_to_screen(ax, ay)
-            cx = sx + self._cell_size / 2
-            cy = sy + self._cell_size / 2
+            cx = sx + self._cell_size // 2
+            cy = sy + self._cell_size // 2
 
-            color = self._agent_color(agent)
+            body_r = max(3, self._cell_size // 3)
+            body_color = (40, 120, 255)  # blue
+            pygame.draw.circle(self._screen, body_color, (cx, cy), body_r)
+            pygame.draw.circle(self._screen, (10, 10, 10), (cx, cy), body_r, 2)
+
+            # Small facing-direction dot.
             heading = self.agent_dir[agent]
+            d = max(2, int(body_r * 0.6))
+            if heading == 0:  # N
+                dot_x, dot_y = cx, cy - d
+            elif heading == 1:  # E
+                dot_x, dot_y = cx + d, cy
+            elif heading == 2:  # S
+                dot_x, dot_y = cx, cy + d
+            else:  # W
+                dot_x, dot_y = cx - d, cy
+            pygame.draw.circle(self._screen, (255, 255, 255), (dot_x, dot_y), max(2, body_r // 4))
+            pygame.draw.circle(self._screen, (10, 10, 10), (dot_x, dot_y), max(2, body_r // 4), 1)
 
-            tri = self._heading_to_triangle(cx, cy, heading, size=self._cell_size * 0.33)
-            pygame.draw.polygon(self._screen, color, tri)
-            pygame.draw.polygon(self._screen, (10, 10, 10), tri, 2)  # outline
-
-        text = self._font.render(f"t={self.timestep}", True, (255, 255, 255))
-        self._screen.blit(text, (10, 10))
+            # Agent number label.
+            agent_num = agent.split("_")[-1] if "_" in agent else "?"
+            agent_label = self._font.render(agent_num, True, (255, 255, 255))
+            al_rect = agent_label.get_rect(center=(cx, cy))
+            self._screen.blit(agent_label, al_rect)
 
         if mode == "human":
             pygame.display.flip()
@@ -777,7 +1075,7 @@ class MAPF(ParallelEnv):
 
 if __name__ == "__main__":
     #env = MAPF(grid_shape=(10, 8), num_agents=4, obs_mode="vector")
-    env = MAPF(num_agents=500, obs_mode="hybrid", map_path="maps/Paris_1_256.craft.txt")
+    env = MAPF(obs_mode="hybrid", map_path="maps/city.domain")
     obs, info = env.reset()
     done = {a: False for a in env.agents}
 
