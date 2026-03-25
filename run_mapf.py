@@ -36,8 +36,6 @@ def load_actor_for_mode(obs_mode, obs_sample, n_actions, device):
 def run_policy(
     actor_path: str,
     obs_mode: str = "vector",   # "vector", "window", "knn", "hybrid"
-    grid_shape=(7, 7),
-    num_agents=3,
     stochastic=True,            # stochastic (sample) vs argmax
     device="cpu",
     map_path=None,
@@ -55,8 +53,6 @@ def run_policy(
     # Create MAPF env
     # -----------------------------
     env = MAPF(
-        grid_shape=grid_shape,
-        num_agents=num_agents,
         obs_mode=obs_mode,
         map_path=map_path,
     )
@@ -140,12 +136,14 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Example usage:
+    # map_path can be:
+    # - a .domain directory (recommended),
+    # - a benchmark .json scenario file, or
+    # - a legacy text map file.
     run_policy(
-        actor_path="mappo_knn_actor.pth",  # or mappo_window_actor.pth or mappo_knn_actor.pth
+        actor_path="mappo_knn_actor.pth",  # or mappo_window_actor.pth or mappo_hybrid_actor.pth
         obs_mode="knn",                    # "vector", "window", "knn", or "hybrid"
-        grid_shape=(7, 7),
-        num_agents=3,
         stochastic=True,
         device=device,
-        map_path="test_map.txt"
+        map_path="maps/random.domain"
     )
