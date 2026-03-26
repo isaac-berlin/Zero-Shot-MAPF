@@ -595,14 +595,19 @@ def train_mappo(
 if __name__ == "__main__":
     set_seed(0)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
+    print(f"Using device: {device}")
+    # map_path can be:
+    # - a .domain directory (recommended),
+    # - a benchmark .json scenario file, or
+    # - a legacy text map file.
+    map_path = "maps/random.domain/random_32_32_20_10.json"
+    obs_mode = "hybrid"  # "vector", "window", "knn", or "hybrid"
     env = MAPF(
-        grid_shape=(10, 8),
-        num_agents=2,
-        obs_mode="hybrid",  # "vector", "window", "knn", or "hybrid"
-        obs_radius=5,
-        map_path="test_map.txt",        # e.g. "maps/example_map.txt"
+        obs_mode=obs_mode,  # "vector", "window", "knn", or "hybrid"
+        obs_radius=10,
+        k_agents=5,
+        map_path=map_path,
     )
 
-    algo = train_mappo(env, total_episodes=20000, rollout_len=128, device=device)
-    torch.save(algo.actor.state_dict(), f"mappo_{env.obs_mode}_actor.pth")
+    algo = train_mappo(env, total_episodes=100, rollout_len=128, device=device)
+    torch.save(algo.actor.state_dict(), f"mappo_{obs_mode}_{map_path.split('/')[-1].split('.')[0]}_actor.pth")

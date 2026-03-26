@@ -23,9 +23,11 @@ def load_actor_for_mode(obs_mode, obs_sample, n_actions, device):
         actor = ActorCNN(obs_shape, n_actions)
     elif obs_mode == "hybrid":
         # obs_sample = Dict with "vector" and "window"
-        vector_dim = obs_sample["vector"].shape[0]
-        window_shape = obs_sample["window"].shape
-        actor = ActorHybrid(vector_dim, window_shape, n_actions)
+        obs_spec = {
+            "vector": obs_sample["vector"].shape,
+            "window": obs_sample["window"].shape,
+        }
+        actor = ActorHybrid(obs_spec, n_actions)
     else:
         raise ValueError(f"Unknown obs_mode: {obs_mode}")
 
@@ -38,6 +40,8 @@ def run_policy(
     obs_mode: str = "vector",   # "vector", "window", "knn", "hybrid"
     stochastic=True,            # stochastic (sample) vs argmax
     device="cpu",
+    obs_radius=3,              # for knn and hybrid
+    k_agents=2,                # for knn and hybrid
     map_path=None,
 ):
     """
@@ -55,6 +59,8 @@ def run_policy(
     env = MAPF(
         obs_mode=obs_mode,
         map_path=map_path,
+        obs_radius=obs_radius,
+        k_agents=k_agents,
     )
 
     agent_order = env.possible_agents[:]
@@ -141,9 +147,11 @@ if __name__ == "__main__":
     # - a benchmark .json scenario file, or
     # - a legacy text map file.
     run_policy(
-        actor_path="mappo_knn_actor.pth",  # or mappo_window_actor.pth or mappo_hybrid_actor.pth
-        obs_mode="knn",                    # "vector", "window", "knn", or "hybrid"
+        actor_path="mappo_hybrid_random_32_32_20_10_actor.pth",  # or mappo_window_actor.pth or mappo_hybrid_actor.pth
+        obs_mode="hybrid",                    # "vector", "window", "knn", or "hybrid"
         stochastic=True,
         device=device,
-        map_path="maps/random.domain"
+        map_path="maps/random.domain/random_32_32_20_10.json",
+        obs_radius=10,
+        k_agents=5,
     )

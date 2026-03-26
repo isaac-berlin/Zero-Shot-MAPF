@@ -58,7 +58,7 @@ class MAPF(ParallelEnv):
         self.n_agents = int(num_agents) if num_agents is not None else 2
         self.obs_radius = obs_radius
         self.k_agents = k_agents
-        self.max_steps = self.grid_h * self.grid_w * 4  # arbitrary large number to prevent infinite episodes
+        self.max_steps = 5000
         self.timestep = 0
         self._using_domain_config = False
 
@@ -1075,7 +1075,7 @@ class MAPF(ParallelEnv):
 
 if __name__ == "__main__":
     #env = MAPF(grid_shape=(10, 8), num_agents=4, obs_mode="vector")
-    env = MAPF(obs_mode="hybrid", map_path="maps/city.domain")
+    env = MAPF(obs_mode="hybrid", map_path="maps/random.domain/random_32_32_20_10.json")
     obs, info = env.reset()
     done = {a: False for a in env.agents}
 
