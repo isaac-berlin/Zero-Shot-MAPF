@@ -1,4 +1,5 @@
 import random
+import time
 from dataclasses import dataclass
 from typing import Dict
 from itertools import combinations
@@ -219,24 +220,48 @@ class RolloutBuffer:
             self.returns[a] = ret
 
     def get_flat_batches(self):
-        obs_list, state_list, act_list = [], [], []
+        first_agent = self.agent_order[0]
+        first_traj = self.storage[first_agent]
+        if not first_traj:
+            raise ValueError("Rollout buffer is empty.")
+
+        hybrid_obs = isinstance(first_traj[0].obs, dict)
+
+        if hybrid_obs:
+            obs_vec_list, obs_win_list = [], []
+        else:
+            obs_list = []
+
+        state_list, act_list = [], []
         logp_list, val_list, adv_list, ret_list = [], [], [], []
 
         for a in self.agent_order:
             traj = self.storage[a]
-            obs_list.append(np.stack([tr.obs for tr in traj]))
-            state_list.append(np.stack([tr.state for tr in traj]))
-            act_list.append(np.array([tr.action for tr in traj]))
-            logp_list.append(np.array([tr.logp for tr in traj], np.float32))
-            val_list.append(np.array([tr.value for tr in traj], np.float32))
+            for tr in traj:
+                if hybrid_obs:
+                    obs_vec_list.append(tr.obs["vector"])
+                    obs_win_list.append(tr.obs["window"])
+                else:
+                    obs_list.append(tr.obs)
+                state_list.append(tr.state)
+                act_list.append(tr.action)
+                logp_list.append(tr.logp)
+                val_list.append(tr.value)
             adv_list.append(self.advantages[a])
             ret_list.append(self.returns[a])
 
-        obs = np.concatenate(obs_list)
-        state = np.concatenate(state_list)
-        acts = np.concatenate(act_list)
-        logps = np.concatenate(logp_list)
-        vals = np.concatenate(val_list)
+        if hybrid_obs:
+            obs = {
+                "vector": np.asarray(obs_vec_list, dtype=np.float32),
+                "window": np.asarray(obs_win_list, dtype=np.float32),
+            }
+        else:
+            obs = np.asarray(obs_list, dtype=np.float32)
+
+        state = np.asarray(state_list, dtype=np.float32)
+        acts = np.asarray(act_list, dtype=np.int64)
+        logps = np.asarray(logp_list, dtype=np.float32)
+        vals = np.asarray(val_list, dtype=np.float32)
         advs = np.concatenate(adv_list)
         rets = np.concatenate(ret_list)
 
@@ -296,14 +321,58 @@ class MAPPO:
         value = self.critic(state_t)
         return int(action.item()), float(logp.item()), float(value.item())
 
+    @torch.no_grad()
+    def act_batch(self, obs_dict, state, agent_order):
+        """
+        Batched action/value inference for all agents at once.
+        Returns three dicts keyed by agent: actions, logps, values.
+        """
+        n = len(agent_order)
+        state_batch = torch.tensor(
+            np.repeat(state[None, :], n, axis=0),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        if self.mode == "hybrid":
+            obs_t = {
+                "vector": torch.tensor(
+                    np.stack([obs_dict[a]["vector"] for a in agent_order]),
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+                "window": torch.tensor(
+                    np.stack([obs_dict[a]["window"] for a in agent_order]),
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+            }
+        else:
+            obs_t = torch.tensor(
+                np.stack([obs_dict[a] for a in agent_order]),
+                dtype=torch.float32,
+                device=self.device,
+            )
+
+        logits = self.actor(obs_t)
+        dist = Categorical(logits=logits)
+        actions_t = dist.sample()
+        logps_t = dist.log_prob(actions_t)
+        values_t = self.critic(state_batch)
+
+        actions = {a: int(actions_t[i].item()) for i, a in enumerate(agent_order)}
+        logps = {a: float(logps_t[i].item()) for i, a in enumerate(agent_order)}
+        values = {a: float(values_t[i].item()) for i, a in enumerate(agent_order)}
+        return actions, logps, values
+
     def update(self, buffer, epochs, minibatch, writer, global_step):
         obs, state, acts, old_logps, old_vals, advs, rets = buffer.get_flat_batches()
         advs = (advs - advs.mean()) / (advs.std() + 1e-8)
 
         if self.mode == "hybrid":
             obs_t = {
-                "vector": torch.tensor(np.stack([o["vector"] for o in obs]), dtype=torch.float32, device=self.device),
-                "window": torch.tensor(np.stack([o["window"] for o in obs]), dtype=torch.float32, device=self.device),
+                "vector": torch.tensor(obs["vector"], dtype=torch.float32, device=self.device),
+                "window": torch.tensor(obs["window"], dtype=torch.float32, device=self.device),
             }
             N = obs_t["vector"].shape[0]
         else:
@@ -406,6 +475,8 @@ def train_mappo(
     gamma=0.99,
     lam=0.95,
     device="cpu",
+    enable_timing=True,
+    timing_every_episodes=10,
 ):
     agent_order = env.possible_agents[:]
     num_agents = len(agent_order)
@@ -452,22 +523,30 @@ def train_mappo(
 
     while episode < total_episodes:
         buffer.clear()
+        ep_timing = {
+            "state_ms": 0.0,
+            "actor_ms": 0.0,
+            "env_step_ms": 0.0,
+            "ppo_ms": 0.0,
+        }
 
         # ------------------------------------------------------------
         # rollout
         # ------------------------------------------------------------
         for _ in range(rollout_len):
+            t0 = time.perf_counter()
             state = stack_global_state(env)
+            ep_timing["state_ms"] += (time.perf_counter() - t0) * 1000.0
 
-            actions, logps, values = {}, {}, {}
+            t1 = time.perf_counter()
+            actions, logps, values = algo.act_batch(obs, state, agent_order)
+            ep_timing["actor_ms"] += (time.perf_counter() - t1) * 1000.0
             for a in agent_order:
-                act, logp, val = algo.act(obs[a], state)
-                actions[a] = act
-                logps[a] = logp
-                values[a] = val
-                action_freq[act] += 1
+                action_freq[actions[a]] += 1
 
+            t2 = time.perf_counter()
             next_obs, rewards, dones, truncs, infos = env.step(actions)
+            ep_timing["env_step_ms"] += (time.perf_counter() - t2) * 1000.0
 
             # approximate "collision count" via collision penalty occurrences
             # (env assigns collision_penalty=-0.1 to involved agents)
@@ -504,6 +583,8 @@ def train_mappo(
 
             # episode end
             if all(dones.values()) or all(truncs.values()):
+                finished_ep_len = ep_len
+
                 # coverage
                 unique_cells_visited = len(visited)
                 coverage_fraction = unique_cells_visited / (env.grid_w * env.grid_h)
@@ -521,6 +602,10 @@ def train_mappo(
                 writer.add_scalar("episode/coverage_fraction", coverage_fraction, episode)
                 writer.add_scalar("episode/mean_pairwise_dist", mean_pairwise, episode)
                 writer.add_scalar("episode/collisions_count", collisions_ep, episode)
+                if enable_timing and finished_ep_len > 0:
+                    writer.add_scalar("timing/state_ms_per_step", ep_timing["state_ms"] / finished_ep_len, episode)
+                    writer.add_scalar("timing/actor_ms_per_step", ep_timing["actor_ms"] / finished_ep_len, episode)
+                    writer.add_scalar("timing/env_step_ms_per_step", ep_timing["env_step_ms"] / finished_ep_len, episode)
 
                 # action frequencies (per-episode)
                 total_actions = max(sum(action_freq.values()), 1)
@@ -543,6 +628,13 @@ def train_mappo(
 
                 pbar.update(1)
                 episode += 1
+                if enable_timing and episode % max(1, timing_every_episodes) == 0 and finished_ep_len > 0:
+                    print(
+                        f"[Timing][Episode {episode}] "
+                        f"state={ep_timing['state_ms']/finished_ep_len:.3f}ms/step, "
+                        f"actor={ep_timing['actor_ms']/finished_ep_len:.3f}ms/step, "
+                        f"env={ep_timing['env_step_ms']/finished_ep_len:.3f}ms/step"
+                    )
                 if episode >= total_episodes:
                     break
 
@@ -568,9 +660,13 @@ def train_mappo(
         adv_mean, adv_std = float(np.mean(advs)), float(np.std(advs))
         val_mean, val_std = float(np.mean(vals)), float(np.std(vals))
 
+        t_ppo = time.perf_counter()
         policy_loss_avg, value_loss_avg, entropy_avg, approx_kl = algo.update(
             buffer, update_epochs, minibatch_size, writer, step_count
         )
+        ep_timing["ppo_ms"] += (time.perf_counter() - t_ppo) * 1000.0
+        if enable_timing:
+            writer.add_scalar("timing/ppo_update_ms", ep_timing["ppo_ms"], step_count)
 
         # update-level TB logging
         writer.add_scalar("update/explained_variance", explained_var, step_count)

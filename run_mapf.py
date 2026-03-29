@@ -1,8 +1,10 @@
 import torch
 from torch.distributions import Categorical
+import numpy as np
+import time
 
 from MAPF import MAPF
-from train_mapf import ActorMLP, ActorCNN, ActorHybrid, stack_global_state
+from train_mapf import ActorMLP, ActorCNN, ActorHybrid
 
 
 # ============================================================
@@ -43,6 +45,8 @@ def run_policy(
     obs_radius=3,              # for knn and hybrid
     k_agents=2,                # for knn and hybrid
     map_path=None,
+    enable_timing=True,
+    timing_every_episodes=1,
 ):
     """
     Unified environment runner for all MAPPO actor types.
@@ -81,6 +85,43 @@ def run_policy(
 
     print(f"\nLoaded {obs_mode} policy from: {actor_path}\n")
 
+    def select_actions_batch(obs_dict):
+        if obs_mode == "hybrid":
+            obs_t = {
+                "vector": torch.tensor(
+                    np.stack([obs_dict[a]["vector"] for a in agent_order]),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                "window": torch.tensor(
+                    np.stack([obs_dict[a]["window"] for a in agent_order]),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            }
+        elif obs_mode == "window":
+            obs_t = torch.tensor(
+                np.stack([obs_dict[a] for a in agent_order]),
+                dtype=torch.float32,
+                device=device,
+            )
+        else:
+            obs_t = torch.tensor(
+                np.stack([obs_dict[a] for a in agent_order]),
+                dtype=torch.float32,
+                device=device,
+            )
+
+        logits = actor(obs_t)
+        dist = Categorical(logits=logits)
+
+        if stochastic:
+            actions_t = dist.sample()
+        else:
+            actions_t = torch.argmax(logits, dim=-1)
+
+        return {a: int(actions_t[i].item()) for i, a in enumerate(agent_order)}
+
     # -----------------------------
     # Run forever
     # -----------------------------
@@ -91,46 +132,40 @@ def run_policy(
 
         total_reward = 0.0
         steps = 0
+        timing = {
+            "render_ms": 0.0,
+            "actor_ms": 0.0,
+            "env_step_ms": 0.0,
+        }
 
         while env.agents and not all(done_flags.values()):
+            t_render = time.perf_counter()
             env.render()
+            timing["render_ms"] += (time.perf_counter() - t_render) * 1000.0
 
-            # Build CTDE global state
-            state = stack_global_state(env)
-
-            actions = {}
-            for a in agent_order:
-                o = obs[a]
-
-                # Preprocess obs for the correct actor type
-                if obs_mode == "hybrid":
-                    o_vector = torch.tensor(o["vector"], dtype=torch.float32, device=device).unsqueeze(0)
-                    o_window = torch.tensor(o["window"], dtype=torch.float32, device=device).unsqueeze(0)
-                    o_t = {"vector": o_vector, "window": o_window}
-                elif obs_mode == "window":
-                    o_t = torch.tensor(o, dtype=torch.float32, device=device).unsqueeze(0).permute(0, 3, 1, 2) # to (B,C,H,W)
-                else:
-                    o_t = torch.tensor(o, dtype=torch.float32, device=device).unsqueeze(0)
-                
-                logits = actor(o_t)
-                
-                dist = Categorical(logits=logits)
-
-                if stochastic:
-                    act = dist.sample()
-                else:
-                    act = torch.argmax(logits, dim=-1)
-
-                actions[a] = int(act.item())
+            t_actor = time.perf_counter()
+            with torch.no_grad():
+                actions = select_actions_batch(obs)
+            timing["actor_ms"] += (time.perf_counter() - t_actor) * 1000.0
 
             # Step environment
+            t_env = time.perf_counter()
             obs, rewards, dones, truncs, infos = env.step(actions)
+            timing["env_step_ms"] += (time.perf_counter() - t_env) * 1000.0
 
             total_reward += float(sum(rewards.values()))
             steps += 1
             done_flags = {a: (dones.get(a, False) or truncs.get(a, False)) for a in agent_order}
 
-        print(f"[Episode {episode}] Return: {total_reward:.2f}, Steps: {steps}")
+        if enable_timing and steps > 0 and episode % max(1, timing_every_episodes) == 0:
+            print(
+                f"[Episode {episode}] Return: {total_reward:.2f}, Steps: {steps}, "
+                f"render={timing['render_ms']/steps:.3f}ms/step, "
+                f"actor={timing['actor_ms']/steps:.3f}ms/step, "
+                f"env={timing['env_step_ms']/steps:.3f}ms/step"
+            )
+        else:
+            print(f"[Episode {episode}] Return: {total_reward:.2f}, Steps: {steps}")
         episode += 1
 
 

@@ -3,6 +3,7 @@ import json
 import os
 import re
 import random
+import heapq
 import numpy as np
 from pettingzoo.utils import ParallelEnv
 from gymnasium import spaces
@@ -71,6 +72,7 @@ class MAPF(ParallelEnv):
         
         # Map configuration
         self.blocked: Set[Tuple[int, int]] = set()
+        self._blocked_grid = np.zeros((self.grid_h, self.grid_w), dtype=np.bool_)
         self.spawn_points: List[Tuple[int, int]] = []
         self.goal_points: List[Tuple[int, int]] = []
         
@@ -80,6 +82,7 @@ class MAPF(ParallelEnv):
                 self.n_agents = self.team_size
             # Grid size may have changed after loading config.
             self.max_steps = self.grid_h * self.grid_w * 4
+        self._refresh_blocked_grid()
 
         # Agents
         self.possible_agents = [f"agent_{i}" for i in range(self.n_agents)]
@@ -121,6 +124,14 @@ class MAPF(ParallelEnv):
         self._screen = None
         self._clock = None
         self._font = None
+        self._static_surface = None
+        self._label_cache: Dict[Tuple[str, Tuple[int, int, int]], pygame.Surface] = {}
+
+    def _refresh_blocked_grid(self) -> None:
+        self._blocked_grid = np.zeros((self.grid_h, self.grid_w), dtype=np.bool_)
+        for bx, by in self.blocked:
+            if 0 <= bx < self.grid_w and 0 <= by < self.grid_h:
+                self._blocked_grid[by, bx] = True
         
     # ============================================================
     # Map file parsing
@@ -252,6 +263,7 @@ class MAPF(ParallelEnv):
         self._validate_points(path, self.blocked, self.spawn_points, self.goal_points)
         self.spawn_points = self._dedup_points(self.spawn_points)
         self.goal_points = self._dedup_points(self.goal_points)
+        self._refresh_blocked_grid()
 
     def _parse_octile_map_file(self, path: str) -> Tuple[int, int, Set[Tuple[int, int]]]:
         """
@@ -491,6 +503,7 @@ class MAPF(ParallelEnv):
         self.blocked = set(blocked)
         self.spawn_points = self._dedup_points(spawns)
         self.goal_points = self._dedup_points(goals)
+        self._refresh_blocked_grid()
 
     def _random_free_cell(self, occupied: Set[Tuple[int, int]]) -> Tuple[int, int]:
         """Random free (non-blocked) cell not in occupied."""
@@ -656,19 +669,21 @@ class MAPF(ParallelEnv):
                     proposed_pos[a] = orig_pos[a]
                     collided.add(a)
 
-        # 3) Edge collisions: swaps => cancel both
-        # Only consider agents that actually moved and weren't already vertex-canceled.
+        # 3) Edge collisions: swaps => cancel both.
+        # Build reverse-transition lookup to avoid O(A^2) pair scans.
         active_movers = [a for a in self.agents if moved[a] and a not in collided]
-
-        for i in range(len(active_movers)):
-            a = active_movers[i]
-            for j in range(i + 1, len(active_movers)):
-                b = active_movers[j]
-                if proposed_pos[a] == orig_pos[b] and proposed_pos[b] == orig_pos[a]:
-                    proposed_pos[a] = orig_pos[a]
-                    proposed_pos[b] = orig_pos[b]
-                    collided.add(a)
-                    collided.add(b)
+        transitions = {
+            (orig_pos[a], proposed_pos[a]): a
+            for a in active_movers
+        }
+        for a in active_movers:
+            reverse = (proposed_pos[a], orig_pos[a])
+            b = transitions.get(reverse)
+            if b is not None and b != a:
+                proposed_pos[a] = orig_pos[a]
+                proposed_pos[b] = orig_pos[b]
+                collided.add(a)
+                collided.add(b)
 
         # Apply collision penalties
         for a in collided:
@@ -792,20 +807,20 @@ class MAPF(ParallelEnv):
 
         obs = np.full((W, W, 3), -1.0, dtype=np.float32)
 
-        def in_bounds(x, y):
-            return 0 <= x < self.grid_w and 0 <= y < self.grid_h
+        # Fill in-bounds window area with vectorized blocked lookup.
+        x0 = max(0, ax - R)
+        x1 = min(self.grid_w, ax + R + 1)
+        y0 = max(0, ay - R)
+        y1 = min(self.grid_h, ay + R + 1)
 
-        # empty cells
-        for dx in range(-R, R + 1):
-            for dy in range(-R, R + 1):
-                wx, wy = ax + dx, ay + dy
-                if in_bounds(wx, wy):
-                    if (wx, wy) in self.blocked:
-                        obs[R + dx, R + dy, 0] = -1.0  # obstacle
-                        obs[R + dx, R + dy, 1] = 0.0
-                        obs[R + dx, R + dy, 2] = 0.0
-                    else:
-                        obs[R + dx, R + dy, :] = 0.0
+        ox0 = x0 - (ax - R)
+        ox1 = ox0 + (x1 - x0)
+        oy0 = y0 - (ay - R)
+        oy1 = oy0 + (y1 - y0)
+
+        obs[ox0:ox1, oy0:oy1, :] = 0.0
+        local_blocked = self._blocked_grid[y0:y1, x0:x1].T
+        obs[ox0:ox1, oy0:oy1, 0] = np.where(local_blocked, -1.0, 0.0)
 
         # ego (channel 0 encodes heading at center cell)
         # heading: 0=N,1=E,2=S,3=W -> 0.25,0.5,0.75,1.0
@@ -817,13 +832,13 @@ class MAPF(ParallelEnv):
                 continue
             ox, oy = self.agent_location[other]
             dx, dy = ox - ax, oy - ay
-            if -R <= dx <= R and -R <= dy <= R and in_bounds(ox, oy):
+            if -R <= dx <= R and -R <= dy <= R:
                 obs[R + dx, R + dy, 1] = 1.0
 
         # own goal only (channel 2)
         gx, gy = self.goal_locations[agent]
         dx, dy = gx - ax, gy - ay
-        if -R <= dx <= R and -R <= dy <= R and in_bounds(gx, gy):
+        if -R <= dx <= R and -R <= dy <= R:
             obs[R + dx, R + dy, 2] = 1.0
 
         return obs
@@ -844,12 +859,15 @@ class MAPF(ParallelEnv):
             dx, dy = ox - ax, oy - ay
             dist = abs(dx) + abs(dy)
             others.append((dist, dx, dy))
-        others.sort(key=lambda x: x[0])
+        if len(others) > self.k_agents:
+            nearest = heapq.nsmallest(self.k_agents, others, key=lambda x: x[0])
+        else:
+            nearest = sorted(others, key=lambda x: x[0])
 
         # nearest agents
         for i in range(self.k_agents):
-            if i < len(others):
-                _, dx, dy = others[i]
+            if i < len(nearest):
+                _, dx, dy = nearest[i]
                 result.extend([dx, dy, 1.0])
             else:
                 result.extend([0.0, 0.0, 0.0])
@@ -927,28 +945,7 @@ class MAPF(ParallelEnv):
                 self._pygame_initialized = False
                 return None
 
-        self._screen.fill((30, 30, 30))
-
-        # grid
-        for x in range(self.grid_w):
-            for y in range(self.grid_h):
-                sx, sy = self._grid_to_screen(x, y)
-                pygame.draw.rect(
-                    self._screen,
-                    (60, 60, 60),
-                    pygame.Rect(sx, sy, self._cell_size, self._cell_size),
-                    1,
-                )
-            # blocked cells (draw AFTER grid lines, BEFORE goals/agents)
-        for (bx, by) in self.blocked:
-            sx, sy = self._grid_to_screen(bx, by)
-            rect = pygame.Rect(sx, sy, self._cell_size, self._cell_size)
-
-            # fill
-            pygame.draw.rect(self._screen, (20, 20, 20), rect)
-
-            # outline for readability
-            pygame.draw.rect(self._screen, (110, 110, 110), rect, 2)
+        self._screen.blit(self._static_surface, (0, 0))
 
         # goals/targets: orange squares with agent number
         for agent in self.possible_agents:
@@ -967,7 +964,7 @@ class MAPF(ParallelEnv):
             pygame.draw.rect(self._screen, (20, 20, 20), goal_rect, 2)
 
             agent_num = agent.split("_")[-1] if "_" in agent else "?"
-            goal_label = self._font.render(agent_num, True, (160, 160, 160))
+            goal_label = self._get_cached_label(agent_num, (160, 160, 160))
             gl_rect = goal_label.get_rect(center=(goal_rect.centerx, goal_rect.centery))
             self._screen.blit(goal_label, gl_rect)
 
@@ -999,7 +996,7 @@ class MAPF(ParallelEnv):
 
             # Agent number label.
             agent_num = agent.split("_")[-1] if "_" in agent else "?"
-            agent_label = self._font.render(agent_num, True, (255, 255, 255))
+            agent_label = self._get_cached_label(agent_num, (255, 255, 255))
             al_rect = agent_label.get_rect(center=(cx, cy))
             self._screen.blit(agent_label, al_rect)
 
@@ -1035,7 +1032,39 @@ class MAPF(ParallelEnv):
         
         font_size = int(max(12, min(24, self._cell_size * 0.6)))
         self._font = pygame.font.SysFont("consolas", font_size)
+        self._static_surface = pygame.Surface((int(width), int(height)))
+        self._build_static_surface()
+        self._label_cache = {}
         self._pygame_initialized = True
+
+    def _build_static_surface(self):
+        self._static_surface.fill((30, 30, 30))
+
+        # Draw static grid once.
+        for x in range(self.grid_w):
+            for y in range(self.grid_h):
+                sx, sy = self._grid_to_screen(x, y)
+                pygame.draw.rect(
+                    self._static_surface,
+                    (60, 60, 60),
+                    pygame.Rect(sx, sy, self._cell_size, self._cell_size),
+                    1,
+                )
+
+        # Draw static blocked cells once.
+        for (bx, by) in self.blocked:
+            sx, sy = self._grid_to_screen(bx, by)
+            rect = pygame.Rect(sx, sy, self._cell_size, self._cell_size)
+            pygame.draw.rect(self._static_surface, (20, 20, 20), rect)
+            pygame.draw.rect(self._static_surface, (110, 110, 110), rect, 2)
+
+    def _get_cached_label(self, text: str, color: Tuple[int, int, int]) -> pygame.Surface:
+        key = (text, color)
+        surface = self._label_cache.get(key)
+        if surface is None:
+            surface = self._font.render(text, True, color)
+            self._label_cache[key] = surface
+        return surface
 
     def _grid_to_screen(self, x, y):
         return (
@@ -1071,6 +1100,8 @@ class MAPF(ParallelEnv):
         if self._pygame_initialized:
             pygame.quit()
             self._pygame_initialized = False
+            self._static_surface = None
+            self._label_cache = {}
 
 
 if __name__ == "__main__":
