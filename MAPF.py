@@ -633,7 +633,7 @@ class MAPF(ParallelEnv):
     def step(self, actions):
         self.timestep += 1
 
-        rewards = {agent: -0.01 for agent in self.agents}
+        rewards = {agent: -0.001 for agent in self.agents}
         collision_penalty = -0.1
 
         # Save originals for collision checks

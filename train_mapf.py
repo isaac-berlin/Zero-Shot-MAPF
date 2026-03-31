@@ -635,6 +635,10 @@ def train_mappo(
                         f"actor={ep_timing['actor_ms']/finished_ep_len:.3f}ms/step, "
                         f"env={ep_timing['env_step_ms']/finished_ep_len:.3f}ms/step"
                     )
+                # Save checkpoint every 50 episodes
+                if episode % 50 == 0:
+                    checkpoint_path = f"mappo_{env.obs_mode}_{map_path.split('/')[-1].split('.')[0]}_actor_ep{episode}.pth"
+                    torch.save(algo.actor.state_dict(), checkpoint_path)
                 if episode >= total_episodes:
                     break
 
@@ -705,5 +709,5 @@ if __name__ == "__main__":
         map_path=map_path,
     )
 
-    algo = train_mappo(env, total_episodes=100, rollout_len=128, device=device)
+    algo = train_mappo(env, total_episodes=1000, rollout_len=128, device=device)
     torch.save(algo.actor.state_dict(), f"mappo_{obs_mode}_{map_path.split('/')[-1].split('.')[0]}_actor.pth")
