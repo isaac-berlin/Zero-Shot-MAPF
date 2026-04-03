@@ -80,8 +80,6 @@ class MAPF(ParallelEnv):
             self._load_map_file(map_path)
             if num_agents is None and self.team_size is not None:
                 self.n_agents = self.team_size
-            # Grid size may have changed after loading config.
-            self.max_steps = self.grid_h * self.grid_w * 4
         self._refresh_blocked_grid()
 
         # Agents
@@ -695,7 +693,7 @@ class MAPF(ParallelEnv):
 
         for a in self.agents:
             if self.agent_location[a] == self.goal_locations[a]:
-                rewards[a] += 1.0
+                rewards[a] += 10.0
                 self._sample_new_goal(a)
 
         # Only truncate by time (no "all goals reached" terminal condition now)
