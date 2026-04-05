@@ -4,7 +4,7 @@ import numpy as np
 import time
 
 from MAPF import MAPF
-from train_mapf import ActorMLP, ActorCNN, ActorHybrid
+from train_mapf import ActorHybrid
 
 
 # ============================================================
@@ -15,23 +15,14 @@ def load_actor_for_mode(obs_mode, obs_sample, n_actions, device):
     """
     Automatically load the correct actor architecture depending on obs_mode.
     """
-    if obs_mode in ("vector", "knn"):
-        # obs_sample = 1D vector
-        obs_dim = obs_sample.shape[0]
-        actor = ActorMLP(obs_dim, n_actions)
-    elif obs_mode == "window":
-        # obs_sample = (H, W, C)
-        obs_shape = obs_sample.shape
-        actor = ActorCNN(obs_shape, n_actions)
-    elif obs_mode == "hybrid":
-        # obs_sample = Dict with "vector" and "window"
-        obs_spec = {
-            "vector": obs_sample["vector"].shape,
-            "window": obs_sample["window"].shape,
-        }
-        actor = ActorHybrid(obs_spec, n_actions)
-    else:
-        raise ValueError(f"Unknown obs_mode: {obs_mode}")
+    if obs_mode != "hybrid":
+        raise ValueError("This runner now only supports obs_mode='hybrid'.")
+
+    obs_spec = {
+        "vector": obs_sample["vector"].shape,
+        "window": obs_sample["window"].shape,
+    }
+    actor = ActorHybrid(obs_spec, n_actions)
 
     actor.to(device)
     return actor
@@ -39,11 +30,10 @@ def load_actor_for_mode(obs_mode, obs_sample, n_actions, device):
 
 def run_policy(
     actor_path: str,
-    obs_mode: str = "vector",   # "vector", "window", "knn", "hybrid"
+    obs_mode: str = "hybrid",
     stochastic=True,            # stochastic (sample) vs argmax
     device="cpu",
-    obs_radius=3,              # for knn and hybrid
-    k_agents=2,                # for knn and hybrid
+    obs_radius=3,
     map_path=None,
     enable_timing=True,
     timing_every_episodes=1,
@@ -64,7 +54,6 @@ def run_policy(
         obs_mode=obs_mode,
         map_path=map_path,
         obs_radius=obs_radius,
-        k_agents=k_agents,
     )
 
     agent_order = env.possible_agents[:]
@@ -86,31 +75,18 @@ def run_policy(
     print(f"\nLoaded {obs_mode} policy from: {actor_path}\n")
 
     def select_actions_batch(obs_dict):
-        if obs_mode == "hybrid":
-            obs_t = {
-                "vector": torch.tensor(
-                    np.stack([obs_dict[a]["vector"] for a in agent_order]),
-                    dtype=torch.float32,
-                    device=device,
-                ),
-                "window": torch.tensor(
-                    np.stack([obs_dict[a]["window"] for a in agent_order]),
-                    dtype=torch.float32,
-                    device=device,
-                ),
-            }
-        elif obs_mode == "window":
-            obs_t = torch.tensor(
-                np.stack([obs_dict[a] for a in agent_order]),
+        obs_t = {
+            "vector": torch.tensor(
+                np.stack([obs_dict[a]["vector"] for a in agent_order]),
                 dtype=torch.float32,
                 device=device,
-            )
-        else:
-            obs_t = torch.tensor(
-                np.stack([obs_dict[a] for a in agent_order]),
+            ),
+            "window": torch.tensor(
+                np.stack([obs_dict[a]["window"] for a in agent_order]),
                 dtype=torch.float32,
                 device=device,
-            )
+            ),
+        }
 
         logits = actor(obs_t)
         dist = Categorical(logits=logits)
@@ -183,10 +159,9 @@ if __name__ == "__main__":
     # - a legacy text map file.
     run_policy(
         actor_path="mappo_hybrid_random_32_32_20_10_actor.pth",  # or mappo_window_actor.pth or mappo_hybrid_actor.pth
-        obs_mode="hybrid",                    # "vector", "window", "knn", or "hybrid"
+        obs_mode="hybrid",
         stochastic=True,
         device=device,
         map_path="maps/random.domain/random_32_32_20_10.json",
         obs_radius=10,
-        k_agents=5,
     )

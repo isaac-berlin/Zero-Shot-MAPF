@@ -14,10 +14,8 @@ class MAPF(ParallelEnv):
     """
     Unified Multi-Agent Pathfinding Environment.
 
-    Observation modes:
-        - "vector": flat structured vector (global coordinates)
-        - "window": local window (image-like) with egocentric heading encoded in channel 0 at center cell
-        - "knn":    K-nearest neighbor encoded vector
+    Observation mode:
+        - "hybrid": local window (3 channels) plus a 2D goal-direction vector
 
     Task: Cooperative MAPF with per-agent assigned goals.
 
@@ -43,13 +41,13 @@ class MAPF(ParallelEnv):
         self,
         grid_shape=(7, 7),
         num_agents: Optional[int] = None,
-        obs_mode="hybrid",    # "vector", "window", "knn", or "hybrid"
-        obs_radius=3,         # used only for window mode
-        k_agents=2,           # used only for knn mode
+        obs_mode="hybrid",
+        obs_radius=3,
         map_path=None,       # optional .json config or .domain directory
     ):
 
-        assert obs_mode in ("vector", "window", "knn", "hybrid")
+        if obs_mode != "hybrid":
+            raise ValueError("This environment now only supports obs_mode='hybrid'.")
         self.obs_mode = obs_mode
         self.map_path = map_path
 
@@ -58,7 +56,6 @@ class MAPF(ParallelEnv):
         
         self.n_agents = int(num_agents) if num_agents is not None else 2
         self.obs_radius = obs_radius
-        self.k_agents = k_agents
         self.max_steps = 5000
         self.timestep = 0
         self._using_domain_config = False
@@ -527,28 +524,11 @@ class MAPF(ParallelEnv):
         return self.observation_spaces[agent]
 
     def _build_observation_space(self):
-        if self.obs_mode == "vector":
-            # heading (1) + ego (2) + other agents (2 each) + own goal (2)
-            size = 1 + 2 + (self.n_agents - 1) * 2 + 2
-            return spaces.Box(low=-1, high=np.inf, shape=(size,), dtype=np.float32)
-
-        elif self.obs_mode == "window":
-            w = 2 * self.obs_radius + 1
-            return spaces.Box(low=-1, high=1, shape=(w, w, 3), dtype=np.float32)
-
-        elif self.obs_mode == "knn":
-            # heading (1) + k_agents * 3 + own goal (3)
-            size = 1 + (self.k_agents ) * 3 + 3
-            return spaces.Box(low=-np.inf, high=np.inf, shape=(size,), dtype=np.float32)
-        
-        elif self.obs_mode == "hybrid":
-            # vector + window
-            w = 2 * self.obs_radius + 1 # window part
-            knn_size = 1 + (self.k_agents ) * 3 + 3 # same as knn vector part
-            return spaces.Dict({
-                "vector": spaces.Box(low=-1, high=np.inf, shape=(knn_size,), dtype=np.float32),
-                "window": spaces.Box(low=-1, high=1, shape=(w, w, 3), dtype=np.float32),
-            })
+        w = 2 * self.obs_radius + 1
+        return spaces.Dict({
+            "vector": spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32),
+            "window": spaces.Box(low=-1.0, high=1.0, shape=(w, w, 3), dtype=np.float32),
+        })
     # ============================================================
     # Reset
     # ============================================================
@@ -762,38 +742,27 @@ class MAPF(ParallelEnv):
         return {a: self._single_obs(a) for a in self.agents}
 
     def _single_obs(self, agent):
-        if self.obs_mode == "vector":
-            return self._obs_vector(agent)
-        elif self.obs_mode == "window":
-            return self._obs_window(agent)
-        elif self.obs_mode == "knn":
-            return self._obs_knn(agent)
-        elif self.obs_mode == "hybrid":
-            return {
-                "vector": self._obs_knn(agent),
-                "window": self._obs_window(agent),
-            }
+        return {
+            "vector": self._obs_goal_vector(agent),
+            "window": self._obs_window(agent),
+        }
 
     # ============================================================
-    # Vector Observation
+    # Goal-direction Vector Observation
     # ============================================================
-    def _obs_vector(self, agent):
-        h = float(self.agent_dir[agent])
+    def _obs_goal_vector(self, agent):
         ax, ay = self.agent_location[agent]
-        obs = [h, ax, ay]
-
-        # others
-        for other in self.agents:
-            if other == agent:
-                continue
-            ox, oy = self.agent_location[other]
-            obs.extend([ox, oy])
-
-        # own goal only
         gx, gy = self.goal_locations[agent]
-        obs.extend([gx, gy])
-
-        return np.array(obs, dtype=np.float32)
+        dx = float(gx - ax)
+        dy = float(gy - ay)
+        norm = float(np.hypot(dx, dy))
+        if norm > 0.0:
+            dx /= norm
+            dy /= norm
+        else:
+            dx = 0.0
+            dy = 0.0
+        return np.array([dx, dy], dtype=np.float32)
 
     # ============================================================
     # WINDOW Observation
@@ -840,43 +809,6 @@ class MAPF(ParallelEnv):
             obs[R + dx, R + dy, 2] = 1.0
 
         return obs
-
-    # ============================================================
-    # KNN Observation
-    # ============================================================
-    def _obs_knn(self, agent):
-        ax, ay = self.agent_location[agent]
-        result = [float(self.agent_dir[agent])]
-
-        # agents
-        others = []
-        for other in self.agents:
-            if other == agent:
-                continue
-            ox, oy = self.agent_location[other]
-            dx, dy = ox - ax, oy - ay
-            dist = abs(dx) + abs(dy)
-            others.append((dist, dx, dy))
-        if len(others) > self.k_agents:
-            nearest = heapq.nsmallest(self.k_agents, others, key=lambda x: x[0])
-        else:
-            nearest = sorted(others, key=lambda x: x[0])
-
-        # nearest agents
-        for i in range(self.k_agents):
-            if i < len(nearest):
-                _, dx, dy = nearest[i]
-                result.extend([dx, dy, 1.0])
-            else:
-                result.extend([0.0, 0.0, 0.0])
-
-        # "items" block becomes own goal (1)
-        gx, gy = self.goal_locations[agent]
-        gdx, gdy = gx - ax, gy - ay
-        result.extend([gdx, gdy, 1.0])
-
-
-        return np.array(result, dtype=np.float32)
 
     # ============================================================
     # Rendering
@@ -1103,7 +1035,6 @@ class MAPF(ParallelEnv):
 
 
 if __name__ == "__main__":
-    #env = MAPF(grid_shape=(10, 8), num_agents=4, obs_mode="vector")
     env = MAPF(obs_mode="hybrid", map_path="maps/random.domain/random_32_32_20_10.json")
     obs, info = env.reset()
     done = {a: False for a in env.agents}

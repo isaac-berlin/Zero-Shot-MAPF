@@ -19,11 +19,10 @@ from run_mapf import load_actor_for_mode
 # Editable hardcoded config
 # ============================================================
 ACTOR_PATH = "mappo_hybrid_random_32_32_20_10_actor.pth"
-OBS_MODE = "hybrid"  # vector | window | knn | hybrid
+OBS_MODE = "hybrid"
 EPISODES = 1
 STOCHASTIC = True
 OBS_RADIUS = 10
-K_AGENTS = 5
 SEED = 0
 DEVICE = None  # None => auto-select cuda if available, else cpu
 OUTPUT_DIR = Path("logs")
@@ -52,25 +51,21 @@ def select_actions_batch(
     device: str,
     stochastic: bool,
 ) -> Dict[str, int]:
-    if obs_mode == "hybrid":
-        obs_t = {
-            "vector": torch.tensor(
-                np.stack([obs_dict[a]["vector"] for a in agent_order]),
-                dtype=torch.float32,
-                device=device,
-            ),
-            "window": torch.tensor(
-                np.stack([obs_dict[a]["window"] for a in agent_order]),
-                dtype=torch.float32,
-                device=device,
-            ),
-        }
-    else:
-        obs_t = torch.tensor(
-            np.stack([obs_dict[a] for a in agent_order]),
+    if obs_mode != "hybrid":
+        raise ValueError("This evaluator now only supports obs_mode='hybrid'.")
+
+    obs_t = {
+        "vector": torch.tensor(
+            np.stack([obs_dict[a]["vector"] for a in agent_order]),
             dtype=torch.float32,
             device=device,
-        )
+        ),
+        "window": torch.tensor(
+            np.stack([obs_dict[a]["window"] for a in agent_order]),
+            dtype=torch.float32,
+            device=device,
+        ),
+    }
 
     logits = actor(obs_t)
     dist = Categorical(logits=logits)
@@ -91,14 +86,12 @@ def run_scenario(
     stochastic: bool,
     episodes: int,
     obs_radius: int,
-    k_agents: int,
     seed: int,
 ) -> Tuple[List[Dict], Dict]:
     env = MAPF(
         obs_mode=obs_mode,
         map_path=str(scenario_path),
         obs_radius=obs_radius,
-        k_agents=k_agents,
     )
 
     try:
@@ -258,7 +251,6 @@ def main() -> None:
                 stochastic=STOCHASTIC,
                 episodes=EPISODES,
                 obs_radius=OBS_RADIUS,
-                k_agents=K_AGENTS,
                 seed=SEED,
             )
             all_episode_rows.extend(episode_rows)

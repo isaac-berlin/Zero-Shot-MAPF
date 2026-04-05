@@ -98,7 +98,7 @@ class ActorHybrid(nn.Module):
         return self.fusion_fc(fusion_input)
 
 class ActorMLP(nn.Module):
-    """Used for obs_mode = vector or knn."""
+    """Legacy actor kept only for compatibility with older checkpoints."""
     def __init__(self, obs_dim, n_actions, hidden=128):
         super().__init__()
         self.net = nn.Sequential(
@@ -225,12 +225,7 @@ class RolloutBuffer:
         if not first_traj:
             raise ValueError("Rollout buffer is empty.")
 
-        hybrid_obs = isinstance(first_traj[0].obs, dict)
-
-        if hybrid_obs:
-            obs_vec_list, obs_win_list = [], []
-        else:
-            obs_list = []
+        obs_vec_list, obs_win_list = [], []
 
         state_list, act_list = [], []
         logp_list, val_list, adv_list, ret_list = [], [], [], []
@@ -238,11 +233,8 @@ class RolloutBuffer:
         for a in self.agent_order:
             traj = self.storage[a]
             for tr in traj:
-                if hybrid_obs:
-                    obs_vec_list.append(tr.obs["vector"])
-                    obs_win_list.append(tr.obs["window"])
-                else:
-                    obs_list.append(tr.obs)
+                obs_vec_list.append(tr.obs["vector"])
+                obs_win_list.append(tr.obs["window"])
                 state_list.append(tr.state)
                 act_list.append(tr.action)
                 logp_list.append(tr.logp)
@@ -250,13 +242,10 @@ class RolloutBuffer:
             adv_list.append(self.advantages[a])
             ret_list.append(self.returns[a])
 
-        if hybrid_obs:
-            obs = {
-                "vector": np.asarray(obs_vec_list, dtype=np.float32),
-                "window": np.asarray(obs_win_list, dtype=np.float32),
-            }
-        else:
-            obs = np.asarray(obs_list, dtype=np.float32)
+        obs = {
+            "vector": np.asarray(obs_vec_list, dtype=np.float32),
+            "window": np.asarray(obs_win_list, dtype=np.float32),
+        }
 
         state = np.asarray(state_list, dtype=np.float32)
         acts = np.asarray(act_list, dtype=np.int64)
@@ -280,17 +269,9 @@ class MAPPO:
         self.num_agents = num_agents
         self.mode = obs_mode
 
-        # --- Build Actor depending on mode ---
-        if obs_mode in ("vector", "knn"):
-            obs_dim = obs_spec
-            self.actor = ActorMLP(obs_dim, n_actions).to(device)
-        elif obs_mode == "window":
-            obs_shape = obs_spec
-            self.actor = ActorCNN(obs_shape, n_actions).to(device)
-        elif obs_mode == "hybrid":
-            self.actor = ActorHybrid(obs_spec, n_actions).to(device)
-        else:
-            raise ValueError(f"Unknown obs_mode: {obs_mode}")
+        if obs_mode != "hybrid":
+            raise ValueError("This trainer now only supports obs_mode='hybrid'.")
+        self.actor = ActorHybrid(obs_spec, n_actions).to(device)
 
         self.critic = CentralCritic(state_dim).to(device)
 
@@ -305,13 +286,10 @@ class MAPPO:
     @torch.no_grad()
     def act(self, obs, state):
         state_t = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
-        if self.mode == "hybrid":
-            obs_t = {
-                "vector": torch.tensor(obs["vector"], dtype=torch.float32, device=self.device).unsqueeze(0),
-                "window": torch.tensor(obs["window"], dtype=torch.float32, device=self.device).unsqueeze(0),
-            }
-        else:
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        obs_t = {
+            "vector": torch.tensor(obs["vector"], dtype=torch.float32, device=self.device).unsqueeze(0),
+            "window": torch.tensor(obs["window"], dtype=torch.float32, device=self.device).unsqueeze(0),
+        }
 
         logits = self.actor(obs_t)
         dist = Categorical(logits=logits)
@@ -334,25 +312,18 @@ class MAPPO:
             device=self.device,
         )
 
-        if self.mode == "hybrid":
-            obs_t = {
-                "vector": torch.tensor(
-                    np.stack([obs_dict[a]["vector"] for a in agent_order]),
-                    dtype=torch.float32,
-                    device=self.device,
-                ),
-                "window": torch.tensor(
-                    np.stack([obs_dict[a]["window"] for a in agent_order]),
-                    dtype=torch.float32,
-                    device=self.device,
-                ),
-            }
-        else:
-            obs_t = torch.tensor(
-                np.stack([obs_dict[a] for a in agent_order]),
+        obs_t = {
+            "vector": torch.tensor(
+                np.stack([obs_dict[a]["vector"] for a in agent_order]),
                 dtype=torch.float32,
                 device=self.device,
-            )
+            ),
+            "window": torch.tensor(
+                np.stack([obs_dict[a]["window"] for a in agent_order]),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+        }
 
         logits = self.actor(obs_t)
         dist = Categorical(logits=logits)
@@ -369,15 +340,11 @@ class MAPPO:
         obs, state, acts, old_logps, old_vals, advs, rets = buffer.get_flat_batches()
         advs = (advs - advs.mean()) / (advs.std() + 1e-8)
 
-        if self.mode == "hybrid":
-            obs_t = {
-                "vector": torch.tensor(obs["vector"], dtype=torch.float32, device=self.device),
-                "window": torch.tensor(obs["window"], dtype=torch.float32, device=self.device),
-            }
-            N = obs_t["vector"].shape[0]
-        else:
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device)
-            N = obs_t.shape[0]
+        obs_t = {
+            "vector": torch.tensor(obs["vector"], dtype=torch.float32, device=self.device),
+            "window": torch.tensor(obs["window"], dtype=torch.float32, device=self.device),
+        }
+        N = obs_t["vector"].shape[0]
             
         state_t = torch.tensor(state, dtype=torch.float32, device=self.device)
         acts_t = torch.tensor(acts, dtype=torch.int64, device=self.device)
@@ -484,15 +451,10 @@ def train_mappo(
     dummy_obs, _ = env.reset()
     sample_obs = dummy_obs[agent_order[0]]
 
-    if env.obs_mode == "window":
-        obs_spec = sample_obs.shape
-    elif env.obs_mode == "hybrid":
-        obs_spec = {
-            "vector": sample_obs["vector"].shape,
-            "window": sample_obs["window"].shape,
-        }
-    else:
-        obs_spec = sample_obs.shape[0]
+    obs_spec = {
+        "vector": sample_obs["vector"].shape,
+        "window": sample_obs["window"].shape,
+    }
 
     state_dim = stack_global_state(env).shape[0]
     n_actions = env.action_space(agent_order[0]).n  # should be 4 now
@@ -701,11 +663,10 @@ if __name__ == "__main__":
     # - a benchmark .json scenario file, or
     # - a legacy text map file.
     map_path = "maps/random.domain/random_32_32_20_10.json"
-    obs_mode = "hybrid"  # "vector", "window", "knn", or "hybrid"
+    obs_mode = "hybrid"
     env = MAPF(
-        obs_mode=obs_mode,  # "vector", "window", "knn", or "hybrid"
+        obs_mode=obs_mode,
         obs_radius=10,
-        k_agents=5,
         map_path=map_path,
     )
 
