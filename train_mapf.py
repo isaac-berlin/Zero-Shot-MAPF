@@ -1,7 +1,9 @@
 import random
 import time
+import json
 from dataclasses import dataclass
-from typing import Dict
+from pathlib import Path
+from typing import Dict, List, Optional
 from itertools import combinations
 
 import tqdm
@@ -13,6 +15,17 @@ from torch.distributions import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
 from MAPF import MAPF
+
+
+TRAIN_GRID_SHAPE = (16, 16)
+TRAIN_NUM_AGENTS = 10
+TRAIN_OBS_RADIUS = 5
+TRAIN_SCENARIOS = ("warehouse", "random")
+TRAIN_RANDOM_ENV_POOL_SIZE = 1000
+TRAIN_ENV_SAMPLE_EVERY_EPISODES = 5
+TRAIN_TB_LOG_EVERY_EPISODES = 5
+WAREHOUSE_MAP_PATH = Path("maps") / "warehouse16.domain" / "maps" / "warehouse_16x16.map"
+TRAIN_RANDOM_ENV_DIR = Path("generated_random_envs")
 
 
 # ============================================================
@@ -27,16 +40,123 @@ def set_seed(seed=0):
 
 def stack_global_state(env) -> np.ndarray:
     """
-    Global CTDE state for MAPF:
-      concat (agent_x, agent_y, heading, goal_x, goal_y) for each agent in env.possible_agents.
+    Global CTDE state for MAPF as a 3-channel grid tensor:
+      channel 0: blocked cells
+      channel 1: agent locations encoded by heading
+      channel 2: goal locations encoded by agent id
     """
-    state = []
-    for agent in env.possible_agents:
+    h, w = env.grid_h, env.grid_w
+    state = np.zeros((3, h, w), dtype=np.float32)
+
+    state[0, :, :] = env._blocked_grid.astype(np.float32)
+
+    num_agents = len(env.possible_agents)
+    for i, agent in enumerate(env.possible_agents):
+        agent_id = (i + 1) / num_agents
+
         ax, ay = env.agent_location[agent]
-        h = env.agent_dir[agent]
+        state[1, ay, ax] = (env.agent_dir[agent] + 1) / 4.0
+
         gx, gy = env.goal_locations[agent]
-        state.extend([ax, ay, h, gx, gy])
-    return np.array(state, dtype=np.float32)
+        state[2, gy, gx] = agent_id
+
+    return state
+
+
+def _sample_obstacle_density(density_range) -> float:
+    low, high = density_range
+    if low > high:
+        raise ValueError("obstacle density range must be ordered as (low, high).")
+
+    mean = (low + high) / 2.0
+    std = max((high - low) / 6.0, 1e-3)
+    density = np.random.normal(loc=mean, scale=std)
+    return float(np.clip(density, low, high))
+
+
+def _load_random_layout(entry: dict, layout_dir: Path) -> dict:
+    json_name = entry["json"]
+    json_path = layout_dir / json_name
+    if not json_path.exists():
+        raise FileNotFoundError(f"Missing random layout file: {json_path}")
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        layout = json.load(f)
+
+    blocked_cells = layout.get("blocked_cells", [])
+    if not isinstance(blocked_cells, list):
+        raise ValueError(f"{json_path}: blocked_cells must be a list.")
+
+    grid_shape = layout.get("grid_shape")
+    if not isinstance(grid_shape, list) or len(grid_shape) != 2:
+        raise ValueError(f"{json_path}: grid_shape must be a two-item list.")
+
+    return {
+        "blocked_cells": tuple(tuple(cell) for cell in blocked_cells),
+        "obstacle_density": float(layout.get("obstacle_density", 0.0)),
+        "grid_shape": tuple(grid_shape),
+        "num_agents": int(layout.get("num_agents", 0)),
+        "name": entry.get("name", json_path.stem),
+    }
+
+
+def build_random_layout_pool_from_dir(layout_dir: Path, pool_size: int) -> List[dict]:
+    manifest_path = layout_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"Expected random environment manifest at {manifest_path}. Run generate_random_envs.py first."
+        )
+
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    if not isinstance(manifest, list) or not manifest:
+        raise ValueError(f"{manifest_path}: manifest must contain a non-empty list of layouts.")
+
+    selected_entries = manifest[:pool_size]
+    return [_load_random_layout(entry, layout_dir) for entry in selected_entries]
+
+
+def build_episode_env(
+    scenario,
+    obs_radius,
+    num_agents,
+    grid_shape,
+    obstacle_density_range,
+    random_layout: Optional[dict] = None,
+):
+    if scenario == "warehouse":
+        return MAPF(
+            obs_mode="hybrid",
+            obs_radius=obs_radius,
+            map_path=str(WAREHOUSE_MAP_PATH),
+            num_agents=num_agents,
+            grid_shape=grid_shape,
+        ), {
+            "scenario": "warehouse",
+            "obstacle_density": 0.0,
+            "map_path": str(WAREHOUSE_MAP_PATH),
+        }
+
+    if scenario == "random":
+        if random_layout is None:
+            raise ValueError("random_layout is required when using disk-backed random environments.")
+
+        env = MAPF(
+            obs_mode="hybrid",
+            obs_radius=obs_radius,
+            num_agents=num_agents,
+            grid_shape=grid_shape,
+            blocked_cells=set(random_layout["blocked_cells"]),
+        )
+
+        return env, {
+            "scenario": "random",
+            "obstacle_density": float(random_layout["obstacle_density"]),
+            "blocked_cell_count": len(random_layout["blocked_cells"]),
+        }
+
+    raise ValueError(f"Unknown training scenario: {scenario!r}")
 
 
 # ============================================================
@@ -153,19 +273,35 @@ class ActorCNN(nn.Module):
 
 class CentralCritic(nn.Module):
     """Central critic shared across all agents."""
-    def __init__(self, state_dim, hidden=256):
+    def __init__(self, state_shape, hidden=64):
         super().__init__()
+        if len(state_shape) != 3:
+            raise ValueError("CentralCritic expects state_shape=(C, H, W).")
+
+        channels, height, width = state_shape
+
+        self.cnn = nn.Sequential(
+            nn.Conv2d(channels, 8, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(8, 16, 3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),
+        )
+
         self.net = nn.Sequential(
-            nn.LayerNorm(state_dim),
-            nn.Linear(state_dim, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, hidden),
+            nn.LayerNorm(16),
+            nn.Linear(16, hidden),
             nn.Tanh(),
             nn.Linear(hidden, 1),
         )
 
     def forward(self, state):
-        return self.net(state).squeeze(-1)
+        if state.dim() == 3:
+            state = state.unsqueeze(0)
+
+        x = self.cnn(state)
+        x = x.reshape(x.size(0), -1)
+        return self.net(x).squeeze(-1)
 
 
 # ============================================================
@@ -262,9 +398,9 @@ class RolloutBuffer:
 # ============================================================
 
 class MAPPO:
-    def __init__(self, obs_spec, n_actions, state_dim, num_agents, obs_mode, device="cpu"):
+    def __init__(self, obs_spec, n_actions, state_shape, num_agents, obs_mode, device="cpu"):
         self.device = device
-        self.state_dim = state_dim
+        self.state_shape = state_shape
         self.n_actions = n_actions
         self.num_agents = num_agents
         self.mode = obs_mode
@@ -273,7 +409,7 @@ class MAPPO:
             raise ValueError("This trainer now only supports obs_mode='hybrid'.")
         self.actor = ActorHybrid(obs_spec, n_actions).to(device)
 
-        self.critic = CentralCritic(state_dim).to(device)
+        self.critic = CentralCritic(state_shape).to(device)
 
         self.opt_actor = optim.Adam(self.actor.parameters(), lr=3e-4)
         self.opt_critic = optim.Adam(self.critic.parameters(), lr=3e-4)
@@ -415,12 +551,6 @@ class MAPPO:
                 mean_entropy += entropy.item()
                 count += 1
 
-                if writer:
-                    writer.add_scalar("loss/policy", policy_loss.item(), global_step)
-                    writer.add_scalar("loss/value", vf_loss.item(), global_step)
-                    writer.add_scalar("loss/entropy", entropy.item(), global_step)
-                    writer.add_scalar("diagnostics/approx_kl", kl.item(), global_step)
-
         return (
             mean_policy_loss / max(count, 1),
             mean_value_loss / max(count, 1),
@@ -434,7 +564,6 @@ class MAPPO:
 # ============================================================
 
 def train_mappo(
-    env,
     total_episodes=3000,
     rollout_len=128,
     update_epochs=4,
@@ -444,11 +573,28 @@ def train_mappo(
     device="cpu",
     enable_timing=True,
     timing_every_episodes=10,
+    num_agents=TRAIN_NUM_AGENTS,
+    grid_shape=TRAIN_GRID_SHAPE,
+    obs_radius=TRAIN_OBS_RADIUS,
+    obstacle_density_range=(0.0, 0.5),
+    random_env_dir=TRAIN_RANDOM_ENV_DIR,
 ):
-    agent_order = env.possible_agents[:]
-    num_agents = len(agent_order)
+    random_layout_pool = build_random_layout_pool_from_dir(
+        Path(random_env_dir),
+        TRAIN_RANDOM_ENV_POOL_SIZE,
+    )
 
-    dummy_obs, _ = env.reset()
+    prototype_env, _ = build_episode_env(
+        scenario="warehouse",
+        obs_radius=obs_radius,
+        num_agents=num_agents,
+        grid_shape=grid_shape,
+        obstacle_density_range=obstacle_density_range,
+    )
+
+    agent_order = prototype_env.possible_agents[:]
+
+    dummy_obs, _ = prototype_env.reset()
     sample_obs = dummy_obs[agent_order[0]]
 
     obs_spec = {
@@ -456,196 +602,245 @@ def train_mappo(
         "window": sample_obs["window"].shape,
     }
 
-    state_dim = stack_global_state(env).shape[0]
-    n_actions = env.action_space(agent_order[0]).n  # should be 4 now
+    state_shape = stack_global_state(prototype_env).shape
+    n_actions = prototype_env.action_space(agent_order[0]).n  # should be 4 now
+
+    prototype_env.close()
 
     algo = MAPPO(
         obs_spec=obs_spec,
         n_actions=n_actions,
-        state_dim=state_dim,
+        state_shape=state_shape,
         num_agents=num_agents,
-        obs_mode=env.obs_mode,
+        obs_mode="hybrid",
         device=device,
     )
 
     buffer = RolloutBuffer(agent_order)
-    writer = SummaryWriter(log_dir=f"runs/mapf_{env.obs_mode}")
+    writer = SummaryWriter(log_dir=f"runs/mapf_hybrid_{grid_shape[0]}x{grid_shape[1]}_{num_agents}agents_mix")
 
-    obs, _ = env.reset()
-    ep_return, ep_len, step_count, episode = 0.0, 0, 0, 0
-
-    # per-episode metric tracking
+    episode = 0
+    step_count = 0
+    env = None
+    obs = None
+    ep_return = 0.0
+    ep_len = 0
+    items_collected_ep = 0
+    current_scenario = None
+    current_episode_meta = {}
     visited = set()
-    agent_prev_pos = {a: env.agent_location[a] for a in agent_order}
-    agent_dist = {a: 0.0 for a in agent_order}
+    agent_prev_pos = {}
+    agent_dist = {}
     action_freq = {0: 0, 1: 0, 2: 0, 3: 0}
     collisions_ep = 0
+    episodes_until_resample = 0
+
+    def start_episode_env(force_resample=False):
+        scenario = random.choice(TRAIN_SCENARIOS)
+        layout = None
+        if scenario == "random":
+            layout = random.choice(random_layout_pool)
+        episode_env, episode_meta = build_episode_env(
+            scenario=scenario,
+            obs_radius=obs_radius,
+            num_agents=num_agents,
+            grid_shape=grid_shape,
+            obstacle_density_range=obstacle_density_range,
+            random_layout=layout,
+        )
+        episode_obs, _ = episode_env.reset()
+        return episode_env, episode_obs, episode_meta, scenario
+
+    env, obs, current_episode_meta, current_scenario = start_episode_env()
+    current_scenario = current_episode_meta["scenario"]
+    agent_prev_pos = {a: env.agent_location[a] for a in agent_order}
+    agent_dist = {a: 0.0 for a in agent_order}
+    episodes_until_resample = TRAIN_ENV_SAMPLE_EVERY_EPISODES
 
     pbar = tqdm.tqdm(total=total_episodes)
 
-    while episode < total_episodes:
-        buffer.clear()
-        ep_timing = {
-            "state_ms": 0.0,
-            "actor_ms": 0.0,
-            "env_step_ms": 0.0,
-            "ppo_ms": 0.0,
-        }
+    try:
+        while episode < total_episodes:
+            buffer.clear()
+            ep_timing = {
+                "state_ms": 0.0,
+                "actor_ms": 0.0,
+                "env_step_ms": 0.0,
+                "ppo_ms": 0.0,
+            }
+            episode_final_state = None
 
-        # ------------------------------------------------------------
-        # rollout
-        # ------------------------------------------------------------
-        for _ in range(rollout_len):
-            t0 = time.perf_counter()
-            state = stack_global_state(env)
-            ep_timing["state_ms"] += (time.perf_counter() - t0) * 1000.0
+            # ------------------------------------------------------------
+            # rollout
+            # ------------------------------------------------------------
+            for _ in range(rollout_len):
+                t0 = time.perf_counter()
+                state = stack_global_state(env)
+                ep_timing["state_ms"] += (time.perf_counter() - t0) * 1000.0
 
-            t1 = time.perf_counter()
-            actions, logps, values = algo.act_batch(obs, state, agent_order)
-            ep_timing["actor_ms"] += (time.perf_counter() - t1) * 1000.0
-            for a in agent_order:
-                action_freq[actions[a]] += 1
+                t1 = time.perf_counter()
+                actions, logps, values = algo.act_batch(obs, state, agent_order)
+                ep_timing["actor_ms"] += (time.perf_counter() - t1) * 1000.0
+                for a in agent_order:
+                    action_freq[actions[a]] += 1
 
-            t2 = time.perf_counter()
-            next_obs, rewards, dones, truncs, infos = env.step(actions)
-            ep_timing["env_step_ms"] += (time.perf_counter() - t2) * 1000.0
+                t2 = time.perf_counter()
+                next_obs, rewards, dones, truncs, infos = env.step(actions)
+                ep_timing["env_step_ms"] += (time.perf_counter() - t2) * 1000.0
 
-            # approximate "collision count" via collision penalty occurrences
-            # (env assigns collision_penalty=-0.1 to involved agents)
-            collisions_ep += sum(1 for a in agent_order if rewards[a] <= -0.01 - 0.1 + 1e-9)
+                # approximate "collision count" via collision penalty occurrences
+                # (env assigns collision_penalty=-0.1 to involved agents)
+                collisions_ep += sum(1 for a in agent_order if rewards[a] <= -0.01 - 0.1 + 1e-9)
+                items_collected_ep += sum(1 for a in agent_order if rewards[a] >= 5.0)
 
-            # distance travelled + coverage
-            for a in agent_order:
-                old = agent_prev_pos[a]
-                new = env.agent_location[a]
-                agent_dist[a] += abs(new[0] - old[0]) + abs(new[1] - old[1])
-                agent_prev_pos[a] = new
-                visited.add(new)
+                # distance travelled + coverage
+                for a in agent_order:
+                    old = agent_prev_pos[a]
+                    new = env.agent_location[a]
+                    agent_dist[a] += abs(new[0] - old[0]) + abs(new[1] - old[1])
+                    agent_prev_pos[a] = new
+                    visited.add(new)
 
-            ep_return += float(sum(rewards.values()))
-            ep_len += 1
-            step_count += num_agents  # keep your original convention
+                ep_return += float(sum(rewards.values()))
+                ep_len += 1
+                step_count += num_agents  # keep your original convention
 
-            # store transitions
-            for a in agent_order:
-                buffer.add(
-                    a,
-                    Transition(
-                        obs=obs[a],
-                        state=state,
-                        action=actions[a],
-                        logp=logps[a],
-                        value=values[a],
-                        reward=rewards[a],
-                        done=dones[a] or truncs[a],
-                    ),
-                )
-
-            obs = next_obs
-
-            # episode end
-            if all(dones.values()) or all(truncs.values()):
-                finished_ep_len = ep_len
-
-                # coverage
-                unique_cells_visited = len(visited)
-                coverage_fraction = unique_cells_visited / (env.grid_w * env.grid_h)
-
-                # mean pairwise distance
-                pair_dists = []
-                locs = [env.agent_location[a] for a in agent_order]
-                for (x1, y1), (x2, y2) in combinations(locs, 2):
-                    pair_dists.append(abs(x1 - x2) + abs(y1 - y2))
-                mean_pairwise = float(np.mean(pair_dists)) if pair_dists else 0.0
-
-                # tensorboard episode metrics
-                writer.add_scalar("episode/return", ep_return, episode)
-                writer.add_scalar("episode/length", ep_len, episode)
-                writer.add_scalar("episode/coverage_fraction", coverage_fraction, episode)
-                writer.add_scalar("episode/mean_pairwise_dist", mean_pairwise, episode)
-                writer.add_scalar("episode/collisions_count", collisions_ep, episode)
-                if enable_timing and finished_ep_len > 0:
-                    writer.add_scalar("timing/state_ms_per_step", ep_timing["state_ms"] / finished_ep_len, episode)
-                    writer.add_scalar("timing/actor_ms_per_step", ep_timing["actor_ms"] / finished_ep_len, episode)
-                    writer.add_scalar("timing/env_step_ms_per_step", ep_timing["env_step_ms"] / finished_ep_len, episode)
-
-                # action frequencies (per-episode)
-                total_actions = max(sum(action_freq.values()), 1)
-                writer.add_scalar("episode-actions/action_frac_forward", action_freq[0] / total_actions, episode)
-                writer.add_scalar("episode-actions/action_frac_turn_right", action_freq[1] / total_actions, episode)
-                writer.add_scalar("episode-actions/action_frac_turn_left", action_freq[2] / total_actions, episode)
-                writer.add_scalar("episode-actions/action_frac_wait", action_freq[3] / total_actions, episode)
-
-                # agent distance travelled (mean)
-                writer.add_scalar("episode/mean_agent_distance", float(np.mean(list(agent_dist.values()))), episode)
-
-                # reset episode metrics
-                obs, _ = env.reset()
-                ep_return, ep_len = 0.0, 0
-                visited.clear()
-                agent_prev_pos = {a: env.agent_location[a] for a in agent_order}
-                agent_dist = {a: 0.0 for a in agent_order}
-                action_freq = {0: 0, 1: 0, 2: 0, 3: 0}
-                collisions_ep = 0
-
-                pbar.update(1)
-                episode += 1
-                if enable_timing and episode % max(1, timing_every_episodes) == 0 and finished_ep_len > 0:
-                    print(
-                        f"[Timing][Episode {episode}] "
-                        f"state={ep_timing['state_ms']/finished_ep_len:.3f}ms/step, "
-                        f"actor={ep_timing['actor_ms']/finished_ep_len:.3f}ms/step, "
-                        f"env={ep_timing['env_step_ms']/finished_ep_len:.3f}ms/step"
+                # store transitions
+                for a in agent_order:
+                    buffer.add(
+                        a,
+                        Transition(
+                            obs=obs[a],
+                            state=state,
+                            action=actions[a],
+                            logp=logps[a],
+                            value=values[a],
+                            reward=rewards[a],
+                            done=dones[a] or truncs[a],
+                        ),
                     )
-                # Save checkpoint every 50 episodes
-                if episode % 50 == 0:
-                    checkpoint_path = f"mappo_{env.obs_mode}_{map_path.split('/')[-1].split('.')[0]}_actor_ep{episode}.pth"
-                    torch.save(algo.actor.state_dict(), checkpoint_path)
-                if episode >= total_episodes:
-                    break
 
-        # ============================================================
-        # PPO Update — TensorBoard update metrics
-        # ============================================================
-        final_state = stack_global_state(env)
-        with torch.no_grad():
-            v_last = algo.critic(
-                torch.tensor(final_state, dtype=torch.float32, device=device).unsqueeze(0)
-            ).item()
-        last_vals = {a: v_last for a in agent_order}
+                obs = next_obs
 
-        buffer.compute_gae(gamma, lam, last_vals)
-        _, _, _, _, vals, advs, rets = buffer.get_flat_batches()
+                # episode end
+                if all(dones.values()) or all(truncs.values()):
+                    finished_ep_len = ep_len
 
-        # explained variance
-        var_y = np.var(rets)
-        var_diff = np.var(rets - vals)
-        explained_var = 1 - var_diff / var_y if var_y > 1e-8 else 0.0
+                    # coverage
+                    unique_cells_visited = len(visited)
+                    coverage_fraction = unique_cells_visited / (env.grid_w * env.grid_h)
 
-        # value + advantage stats
-        adv_mean, adv_std = float(np.mean(advs)), float(np.std(advs))
-        val_mean, val_std = float(np.mean(vals)), float(np.std(vals))
+                    # mean pairwise distance
+                    pair_dists = []
+                    locs = [env.agent_location[a] for a in agent_order]
+                    for (x1, y1), (x2, y2) in combinations(locs, 2):
+                        pair_dists.append(abs(x1 - x2) + abs(y1 - y2))
+                    mean_pairwise = float(np.mean(pair_dists)) if pair_dists else 0.0
 
-        t_ppo = time.perf_counter()
-        policy_loss_avg, value_loss_avg, entropy_avg, approx_kl = algo.update(
-            buffer, update_epochs, minibatch_size, writer, step_count
-        )
-        ep_timing["ppo_ms"] += (time.perf_counter() - t_ppo) * 1000.0
-        if enable_timing:
-            writer.add_scalar("timing/ppo_update_ms", ep_timing["ppo_ms"], step_count)
+                    episode_final_state = stack_global_state(env)
 
-        # update-level TB logging
-        writer.add_scalar("update/explained_variance", explained_var, step_count)
-        writer.add_scalar("update/adv_mean", adv_mean, step_count)
-        writer.add_scalar("update/adv_std", adv_std, step_count)
-        writer.add_scalar("update/value_mean", val_mean, step_count)
-        writer.add_scalar("update/value_std", val_std, step_count)
-        writer.add_scalar("update/policy_loss", policy_loss_avg, step_count)
-        writer.add_scalar("update/value_loss", value_loss_avg, step_count)
-        writer.add_scalar("update/entropy", entropy_avg, step_count)
-        writer.add_scalar("update/approx_kl_avg", approx_kl, step_count)
+                    pbar.update(1)
+                    episode += 1
+                    episodes_until_resample -= 1
+                    if enable_timing and episode % max(1, timing_every_episodes) == 0 and finished_ep_len > 0:
+                        print(
+                            f"[Timing][Episode {episode}] "
+                            f"state={ep_timing['state_ms']/finished_ep_len:.3f}ms/step, "
+                            f"actor={ep_timing['actor_ms']/finished_ep_len:.3f}ms/step, "
+                            f"env={ep_timing['env_step_ms']/finished_ep_len:.3f}ms/step"
+                        )
+                    # Save checkpoint every 50 episodes
+                    if episode % 50 == 0:
+                        checkpoint_path = f"mappo_hybrid_{grid_shape[0]}x{grid_shape[1]}_{num_agents}agents_mix_actor_ep{episode}.pth"
+                        torch.save(algo.actor.state_dict(), checkpoint_path)
 
-    env.close()
+                    log_episode = episode % TRAIN_TB_LOG_EVERY_EPISODES == 0 or episode == total_episodes
+                    if log_episode:
+                        writer.add_scalar("episode/total_return", ep_return, episode)
+                        writer.add_scalar("episode/return", ep_return, episode)
+                        writer.add_scalar("episode/length", ep_len, episode)
+                        writer.add_scalar("episode/collisions_count", collisions_ep, episode)
+                        writer.add_scalar("episode/items_collected", items_collected_ep, episode)
+                        writer.add_scalar("episode/scenario_is_random", 1.0 if current_scenario == "random" else 0.0, episode)
+                        writer.add_scalar("episode/random_obstacle_density", float(current_episode_meta.get("obstacle_density", 0.0)), episode)
+                        writer.add_scalar("episode/coverage_fraction", coverage_fraction, episode)
+                        writer.add_scalar("episode/mean_pairwise_dist", mean_pairwise, episode)
+                        writer.add_scalar("episode/mean_agent_distance", float(np.mean(list(agent_dist.values()))), episode)
+                        total_actions = max(sum(action_freq.values()), 1)
+                        writer.add_scalar("episode-actions/action_frac_forward", action_freq[0] / total_actions, episode)
+                        writer.add_scalar("episode-actions/action_frac_turn_right", action_freq[1] / total_actions, episode)
+                        writer.add_scalar("episode-actions/action_frac_turn_left", action_freq[2] / total_actions, episode)
+                        writer.add_scalar("episode-actions/action_frac_wait", action_freq[3] / total_actions, episode)
+                        if enable_timing and finished_ep_len > 0:
+                            writer.add_scalar("timing/state_ms_per_step", ep_timing["state_ms"] / finished_ep_len, episode)
+                            writer.add_scalar("timing/actor_ms_per_step", ep_timing["actor_ms"] / finished_ep_len, episode)
+                            writer.add_scalar("timing/env_step_ms_per_step", ep_timing["env_step_ms"] / finished_ep_len, episode)
+
+                    # Reset environment for next rollout if not done
+                    if episode < total_episodes:
+                        if episodes_until_resample <= 0:
+                            env.close()
+                            env, obs, current_episode_meta, current_scenario = start_episode_env()
+                            episodes_until_resample = TRAIN_ENV_SAMPLE_EVERY_EPISODES
+                        else:
+                            obs, _ = env.reset()
+                        agent_prev_pos = {a: env.agent_location[a] for a in agent_order}
+                        agent_dist = {a: 0.0 for a in agent_order}
+                        visited.clear()
+                        action_freq = {0: 0, 1: 0, 2: 0, 3: 0}
+                        collisions_ep = 0
+                        items_collected_ep = 0
+                        ep_return = 0.0
+                        ep_len = 0
+
+                    if episode >= total_episodes:
+                        break
+
+            # ============================================================
+            # PPO Update — TensorBoard update metrics
+            # ============================================================
+            final_state = episode_final_state if episode_final_state is not None else stack_global_state(env)
+            with torch.no_grad():
+                v_last = algo.critic(
+                    torch.tensor(final_state, dtype=torch.float32, device=device).unsqueeze(0)
+                ).item()
+            last_vals = {a: v_last for a in agent_order}
+
+            buffer.compute_gae(gamma, lam, last_vals)
+            _, _, _, _, vals, advs, rets = buffer.get_flat_batches()
+
+            # explained variance
+            var_y = np.var(rets)
+            var_diff = np.var(rets - vals)
+            explained_var = 1 - var_diff / var_y if var_y > 1e-8 else 0.0
+
+            # value + advantage stats
+            adv_mean, adv_std = float(np.mean(advs)), float(np.std(advs))
+            val_mean, val_std = float(np.mean(vals)), float(np.std(vals))
+
+            t_ppo = time.perf_counter()
+            policy_loss_avg, value_loss_avg, entropy_avg, approx_kl = algo.update(
+                buffer, update_epochs, minibatch_size, writer, step_count
+            )
+            ep_timing["ppo_ms"] += (time.perf_counter() - t_ppo) * 1000.0
+            log_update = episode % TRAIN_TB_LOG_EVERY_EPISODES == 0 or episode == total_episodes
+            if enable_timing and log_update:
+                writer.add_scalar("timing/ppo_update_ms", ep_timing["ppo_ms"], step_count)
+
+            if log_update:
+                writer.add_scalar("update/explained_variance", explained_var, step_count)
+                writer.add_scalar("update/adv_mean", adv_mean, step_count)
+                writer.add_scalar("update/adv_std", adv_std, step_count)
+                writer.add_scalar("update/value_mean", val_mean, step_count)
+                writer.add_scalar("update/value_std", val_std, step_count)
+                writer.add_scalar("update/policy_loss", policy_loss_avg, step_count)
+                writer.add_scalar("update/value_loss", value_loss_avg, step_count)
+                writer.add_scalar("update/entropy", entropy_avg, step_count)
+                writer.add_scalar("update/approx_kl_avg", approx_kl, step_count)
+
+    finally:
+        if env is not None:
+            env.close()
     writer.close()
     return algo
 
@@ -658,17 +853,9 @@ if __name__ == "__main__":
     set_seed(0)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
-    # map_path can be:
-    # - a .domain directory (recommended),
-    # - a benchmark .json scenario file, or
-    # - a legacy text map file.
-    map_path = "maps/random.domain/random_32_32_20_10.json"
-    obs_mode = "hybrid"
-    env = MAPF(
-        obs_mode=obs_mode,
-        obs_radius=10,
-        map_path=map_path,
-    )
 
-    algo = train_mappo(env, total_episodes=1000, rollout_len=128, device=device)
-    torch.save(algo.actor.state_dict(), f"mappo_{obs_mode}_{map_path.split('/')[-1].split('.')[0]}_actor.pth")
+    algo = train_mappo(total_episodes=1000, rollout_len=128, device=device)
+    torch.save(
+        algo.actor.state_dict(),
+        f"mappo_hybrid_{TRAIN_GRID_SHAPE[0]}x{TRAIN_GRID_SHAPE[1]}_{TRAIN_NUM_AGENTS}agents_mix_actor.pth",
+    )

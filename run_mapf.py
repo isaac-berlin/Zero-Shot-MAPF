@@ -33,10 +33,11 @@ def run_policy(
     obs_mode: str = "hybrid",
     stochastic=True,            # stochastic (sample) vs argmax
     device="cpu",
-    obs_radius=3,
+    obs_radius=5,
     map_path=None,
     enable_timing=True,
     timing_every_episodes=1,
+    num_agents=None,
 ):
     """
     Unified environment runner for all MAPPO actor types.
@@ -50,11 +51,19 @@ def run_policy(
     # -----------------------------
     # Create MAPF env
     # -----------------------------
-    env = MAPF(
-        obs_mode=obs_mode,
-        map_path=map_path,
-        obs_radius=obs_radius,
-    )
+    if num_agents is None:
+        env = MAPF(
+            obs_mode=obs_mode,
+            map_path=map_path,
+            obs_radius=obs_radius,
+        )
+    else:
+        env = MAPF(
+            obs_mode=obs_mode,
+            map_path=map_path,
+            obs_radius=obs_radius,
+            num_agents=num_agents,
+        )
 
     agent_order = env.possible_agents[:]
 
@@ -107,6 +116,7 @@ def run_policy(
         done_flags = {a: False for a in agent_order}
 
         total_reward = 0.0
+        goals_reached = 0
         steps = 0
         timing = {
             "render_ms": 0.0,
@@ -130,18 +140,19 @@ def run_policy(
             timing["env_step_ms"] += (time.perf_counter() - t_env) * 1000.0
 
             total_reward += float(sum(rewards.values()))
+            goals_reached += sum(1 for r in rewards.values() if r >= 9.0)
             steps += 1
             done_flags = {a: (dones.get(a, False) or truncs.get(a, False)) for a in agent_order}
 
         if enable_timing and steps > 0 and episode % max(1, timing_every_episodes) == 0:
             print(
-                f"[Episode {episode}] Return: {total_reward:.2f}, Steps: {steps}, "
+                f"[Episode {episode}] Return: {total_reward:.2f}, Goals: {goals_reached}, Steps: {steps}, "
                 f"render={timing['render_ms']/steps:.3f}ms/step, "
                 f"actor={timing['actor_ms']/steps:.3f}ms/step, "
                 f"env={timing['env_step_ms']/steps:.3f}ms/step"
             )
         else:
-            print(f"[Episode {episode}] Return: {total_reward:.2f}, Steps: {steps}")
+            print(f"[Episode {episode}] Return: {total_reward:.2f}, Goals: {goals_reached}, Steps: {steps}")
         episode += 1
 
 
@@ -158,10 +169,10 @@ if __name__ == "__main__":
     # - a benchmark .json scenario file, or
     # - a legacy text map file.
     run_policy(
-        actor_path="mappo_hybrid_random_32_32_20_10_actor.pth",  # or mappo_window_actor.pth or mappo_hybrid_actor.pth
+        actor_path="mappo_hybrid_16x16_10agents_mix_actor.pth",  # or mappo_window_actor.pth or mappo_hybrid_actor.pth
         obs_mode="hybrid",
         stochastic=True,
         device=device,
-        map_path="maps/random.domain/random_32_32_20_10.json",
-        obs_radius=10,
+        map_path=r"maps\warehouse16.domain\maps\warehouse_16x16.map",
+        obs_radius=5,
     )

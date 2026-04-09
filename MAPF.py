@@ -44,6 +44,7 @@ class MAPF(ParallelEnv):
         obs_mode="hybrid",
         obs_radius=3,
         map_path=None,       # optional .json config or .domain directory
+        blocked_cells: Optional[Set[Tuple[int, int]]] = None,
     ):
 
         if obs_mode != "hybrid":
@@ -77,6 +78,9 @@ class MAPF(ParallelEnv):
             self._load_map_file(map_path)
             if num_agents is None and self.team_size is not None:
                 self.n_agents = self.team_size
+        elif blocked_cells is not None:
+            self.blocked = set(blocked_cells)
+            self._validate_points("blocked_cells", self.blocked, [], [])
         self._refresh_blocked_grid()
 
         # Agents
@@ -613,9 +617,15 @@ class MAPF(ParallelEnv):
 
         rewards = {agent: -0.001 for agent in self.agents}
         collision_penalty = -0.1
+        wall_bump_penalty = -0.01
+        shaping_scale = 0.05
 
         # Save originals for collision checks
         orig_pos = {a: self.agent_location[a] for a in self.agents}
+        prev_goal_dist = {
+            a: abs(self.goal_locations[a][0] - orig_pos[a][0]) + abs(self.goal_locations[a][1] - orig_pos[a][1])
+            for a in self.agents
+        }
 
         # 1) Apply turns immediately; compute proposed moves for forward
         proposed_pos = {a: orig_pos[a] for a in self.agents}
@@ -632,6 +642,8 @@ class MAPF(ParallelEnv):
             elif action == 0:  # forward
                 proposed_pos[agent] = self._forward(orig_pos[agent], self.agent_dir[agent])
                 moved[agent] = True
+                if proposed_pos[agent] == orig_pos[agent]:
+                    rewards[agent] += wall_bump_penalty
             elif action == 3:  # wait
                 pass
 
@@ -670,6 +682,14 @@ class MAPF(ParallelEnv):
         # 4) Commit positions
         for a in self.agents:
             self.agent_location[a] = proposed_pos[a]
+
+        for a in self.agents:
+            new_pos = self.agent_location[a]
+            new_goal_dist = abs(self.goal_locations[a][0] - new_pos[0]) + abs(self.goal_locations[a][1] - new_pos[1])
+            dist_delta = prev_goal_dist[a] - new_goal_dist
+            # Only reward if agent moved toward goal (dist decreased)
+            if dist_delta > 0:
+                rewards[a] += shaping_scale * float(dist_delta)
 
         for a in self.agents:
             if self.agent_location[a] == self.goal_locations[a]:
@@ -751,6 +771,19 @@ class MAPF(ParallelEnv):
     # Goal-direction Vector Observation
     # ============================================================
     def _obs_goal_vector(self, agent):
+        """
+        Goal direction vector relative to the agent's heading.
+        
+        Returns a normalized 2D vector [forward_component, right_component] where:
+        - forward_component: how much the goal is in front of the agent (1 = directly ahead)
+        - right_component: how much the goal is to the right of the agent (1 = directly right)
+        
+        Headings:
+            0 = North (+y)
+            1 = East  (+x)
+            2 = South (-y)
+            3 = West  (-x)
+        """
         ax, ay = self.agent_location[agent]
         gx, gy = self.goal_locations[agent]
         dx = float(gx - ax)
@@ -762,7 +795,23 @@ class MAPF(ParallelEnv):
         else:
             dx = 0.0
             dy = 0.0
-        return np.array([dx, dy], dtype=np.float32)
+        
+        # Transform global vector (dx, dy) to agent-relative frame based on heading
+        heading = self.agent_dir[agent]
+        if heading == 0:  # North: forward=(0,1), right=(1,0)
+            local_forward = dy
+            local_right = dx
+        elif heading == 1:  # East: forward=(1,0), right=(0,-1)
+            local_forward = dx
+            local_right = -dy
+        elif heading == 2:  # South: forward=(0,-1), right=(-1,0)
+            local_forward = -dy
+            local_right = -dx
+        else:  # heading == 3, West: forward=(-1,0), right=(0,1)
+            local_forward = -dx
+            local_right = dy
+        
+        return np.array([local_forward, local_right], dtype=np.float32)
 
     # ============================================================
     # WINDOW Observation

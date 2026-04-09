@@ -208,3 +208,6 @@ __marimo__/
 
 # tensorboard
 runs/
+
+# random generated maps
+generated_random_envs/
