@@ -18,11 +18,11 @@ from run_mapf import load_actor_for_mode
 # ============================================================
 # Editable hardcoded config
 # ============================================================
-ACTOR_PATH = "mappo_hybrid_random_32_32_20_10_actor.pth"
+ACTOR_PATH = "mappo_hybrid_16x16_10agents_mix_actor.pth"
 OBS_MODE = "hybrid"
 EPISODES = 1
 STOCHASTIC = True
-OBS_RADIUS = 10
+OBS_RADIUS = 5
 SEED = 0
 DEVICE = None  # None => auto-select cuda if available, else cpu
 OUTPUT_DIR = Path("logs")

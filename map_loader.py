@@ -29,6 +29,7 @@ def load_map_configuration(
     Load either:
     - .domain directory containing one or more benchmark JSON configs,
     - benchmark JSON config (.json) that points to .map/.agents/.tasks files, or
+    - octile map file (.map) with no spawn/goal points, or
     - legacy text directive format.
     """
     grid_h, grid_w = default_grid_shape
@@ -40,6 +41,23 @@ def load_map_configuration(
 
     if resolved_path.lower().endswith(".json"):
         return _load_benchmark_json(resolved_path)
+    
+    # Check if it's an octile map file (Moving AI format)
+    if resolved_path.lower().endswith(".map"):
+        width, height, blocked = _parse_octile_map_file(resolved_path)
+        return MapLoadResult(
+            grid_w=width,
+            grid_h=height,
+            blocked=set(blocked),
+            spawn_points=[],
+            goal_points=[],
+            using_domain_config=False,
+            team_size=None,
+            num_tasks_reveal=None,
+            agent_size=None,
+            max_counter=None,
+            delay_config={},
+        )
 
     return _load_legacy_map_file(resolved_path, grid_w=grid_w, grid_h=grid_h)
 
@@ -283,7 +301,7 @@ def _parse_octile_map_file(path: str) -> Tuple[int, int, Set[Tuple[int, int]]]:
         raise ValueError(f"{path}: expected {height} map rows, got fewer.")
 
     blocked: Set[Tuple[int, int]] = set()
-    obstacle_symbols = {"@", "T"}
+    obstacle_symbols = {"@", "O", "T"}
 
     for row in range(height):
         map_row = raw_lines[map_start + row]
@@ -399,3 +417,85 @@ def _validate_points(
             raise ValueError(f"{source}: goal out of bounds: {p} for GRID {grid_h}x{grid_w}")
         if p in blocked:
             raise ValueError(f"{source}: goal on blocked cell: {p}")
+
+
+@dataclass
+class MovingAIScenarioCase:
+    """Represents a single test case from a Moving AI scenario file."""
+    bucket: int
+    map_file: str
+    map_width: int
+    map_height: int
+    start_x: int
+    start_y: int
+    goal_x: int
+    goal_y: int
+    optimal_length: float
+
+
+def parse_moving_ai_scenario(scenario_path: str, base_dir: str = None) -> List[MovingAIScenarioCase]:
+    """
+    Parse a Moving AI .scen scenario file.
+    
+    Args:
+        scenario_path: Path to the .scen file
+        base_dir: Base directory for resolving relative map paths (defaults to scenario parent dir)
+    
+    Returns:
+        List of MovingAIScenarioCase objects
+    """
+    if base_dir is None:
+        base_dir = os.path.dirname(scenario_path)
+    
+    cases: List[MovingAIScenarioCase] = []
+    
+    with open(scenario_path, "r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip()]
+    
+    if not lines:
+        raise ValueError(f"{scenario_path}: empty scenario file.")
+    
+    version_line = lines[0].lower()
+    if not version_line.startswith("version"):
+        raise ValueError(f"{scenario_path}: first line must be 'version x.x', got: {lines[0]}")
+    
+    for lineno, line in enumerate(lines[1:], start=2):
+        parts = line.split()
+        if len(parts) < 9:
+            raise ValueError(f"{scenario_path}:{lineno}: expected 9 fields, got {len(parts)}")
+        
+        try:
+            bucket = int(parts[0])
+            map_file = parts[1]
+            map_width = int(parts[2])
+            map_height = int(parts[3])
+            start_x = int(parts[4])
+            start_y = int(parts[5])
+            goal_x = int(parts[6])
+            goal_y = int(parts[7])
+            optimal_length = float(parts[8])
+        except (ValueError, IndexError) as e:
+            raise ValueError(f"{scenario_path}:{lineno}: failed to parse fields: {e}")
+        
+        # Resolve map file path relative to scenario directory
+        try:
+            map_path = os.path.normpath(os.path.join(base_dir, map_file))
+        except Exception as e:
+            raise ValueError(f"{scenario_path}:{lineno}: failed to resolve map path '{map_file}': {e}")
+        
+        cases.append(
+            MovingAIScenarioCase(
+                bucket=bucket,
+                map_file=map_path,
+                map_width=map_width,
+                map_height=map_height,
+                start_x=start_x,
+                start_y=start_y,
+                goal_x=goal_x,
+                goal_y=goal_y,
+                optimal_length=optimal_length,
+            )
+        )
+    
+    return cases
+

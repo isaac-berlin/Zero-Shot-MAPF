@@ -37,7 +37,11 @@ Main behavior:
 	- wall-bump penalty
 	- collision penalty
 	- positive shaping for reducing Manhattan distance to goal
-	- goal completion bonus and immediate goal resampling
+	- goal completion bonus (+10)
+
+Task modes:
+	- `lifelong=True` (default for training): immediate goal resampling on completion
+	- `lifelong=False` (for Moving AI evaluation): agents marked as done when goal is reached
 - Episode termination:
 	- truncation by max step count only
 - Rendering:
@@ -72,7 +76,20 @@ Supported map inputs:
 	- maxCounter or agentCounter
 	- delayConfig (object or relative JSON file path)
 
-3. Legacy text map format
+3. Moving AI octile format (.map files)
+- Standard header: type, height, width, map
+- ASCII grid with characters:
+	- . (passable terrain)
+	- G (passable terrain)
+	- @ (out of bounds)
+	- O (out of bounds)
+	- T (trees, unpassable)
+	- S (swamp, passable from regular terrain)
+	- W (water, traversable but not passable from terrain)
+- Blocked cells: @, O, T
+- Note: When loading a .map file directly, no spawn/goal points are defined; they must be set externally or via the scenario parser
+
+4. Legacy text map format
 - Supports directives:
 	- GRID H W
 	- BLOCK x y
@@ -177,6 +194,27 @@ What it does:
 	- logs/lorr_task_reaches.csv
 - Records per-episode rows and per-scenario summary aggregates.
 
+### eval_moving_ai.py
+
+Batch evaluator for Moving AI MAPF benchmark scenarios.
+
+What it does:
+
+- Discovers all .scen files in MovingAI_eval/ directory.
+- For each scenario, parses test cases (map file + start/goal positions).
+- Runs each test case with a trained actor for up to 5000 timesteps.
+- Tracks whether agents reached their goals and the number of steps taken.
+- Outputs three files:
+	- logs/moving_ai_results.json (all test results + scenario summaries)
+	- logs/moving_ai_results.csv (per-test-case results)
+	- logs/moving_ai_summary.csv (per-scenario success rates and statistics)
+
+Configuration (edit at top of file):
+- `ACTOR_PATH`: Path to trained actor model (.pth file)
+- `OBS_RADIUS`: Must match training value (default 5 for mappo_hybrid_16x16_10agents_mix_actor.pth)
+- `MAX_STEPS`: Episode length limit (default 5000)
+- `MOVING_AI_DIR`: Directory containing .scen and .map files (default "MovingAI_eval")
+
 ### generate_random_envs.py
 
 Utility to pre-generate random blocked layouts on disk.
@@ -224,15 +262,33 @@ python run_mapf.py
 python eval_lorr_tasks.py
 ```
 
+5. Evaluate on Moving AI benchmarks
+
+```bash
+python eval_moving_ai.py
+```
+
 ## Map Path Notes
 
 MAPF accepts map_path values that match map_loader.py formats:
 
 - .domain directory (expects JSON scenario files directly inside that directory)
 - benchmark JSON scenario file
+- Moving AI octile format .map file
 - legacy text map file with GRID/BLOCK style directives
 
 If a .domain directory has no scenario JSON files, loading will fail with a clear error.
+
+## Environment Configuration
+
+Key parameters for MAPF initialization:
+
+- `grid_shape`: Environment dimensions (default 7x7 or inferred from map_path)
+- `num_agents`: Number of agents (default 2 or inferred from domain config)
+- `obs_radius`: Observation window radius (default 3; **must be 5 for eval_moving_ai.py**)
+- `lifelong`: Task mode
+	- `True` (default): Agents receive new goals on reaching current ones (training)
+	- `False`: Agents marked as done when reaching goal (traditional MAPF, used for Moving AI evaluation)
 
 ## Main Artifacts Produced
 
@@ -240,4 +296,5 @@ If a .domain directory has no scenario JSON files, loading will fail with a clea
 - Intermediate checkpoints: mappo_hybrid_..._actor_epN.pth
 - TensorBoard logs: runs/...
 - LORR evaluation logs: logs/lorr_task_reaches.json and logs/lorr_task_reaches.csv
+- Moving AI evaluation logs: logs/moving_ai_results.json, logs/moving_ai_results.csv, logs/moving_ai_summary.csv
 - Random layout corpus: generated_random_envs/*.json, generated_random_envs/*.map, generated_random_envs/manifest.json

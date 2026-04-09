@@ -15,7 +15,9 @@ class MAPF(ParallelEnv):
     Observation mode:
         - "hybrid": local window (3 channels) plus a 2D goal-direction vector
 
-    Task: Cooperative MAPF with per-agent assigned goals.
+    Task modes:
+        - lifelong=True (default): Agents receive new goals upon reaching current ones
+        - lifelong=False: Traditional MAPF; agents are done when reaching their goal
 
     Actions (Discrete(4)):
         0: forward
@@ -43,11 +45,14 @@ class MAPF(ParallelEnv):
         obs_radius=3,
         map_path=None,       # optional .json config or .domain directory
         blocked_cells: Optional[Set[Tuple[int, int]]] = None,
+        lifelong=True,       # True: generate new goal on reaching current one (lifelong)
+                             # False: agent done when reaching goal (traditional MAPF)
     ):
 
         if obs_mode != "hybrid":
             raise ValueError("This environment now only supports obs_mode='hybrid'.")
         self.obs_mode = obs_mode
+        self.lifelong = lifelong
         self.map_path = map_path
 
         self.grid_h = grid_shape[0]
@@ -363,18 +368,28 @@ class MAPF(ParallelEnv):
             if dist_delta > 0:
                 rewards[a] += shaping_scale * float(dist_delta)
 
+        # Track which agents reach their goal in this step (for traditional MAPF mode)
+        agent_done_early = {a: False for a in self.agents}
+
         for a in self.agents:
             if self.agent_location[a] == self.goal_locations[a]:
                 rewards[a] += 10.0
-                self._sample_new_goal(a)
+                if self.lifelong:
+                    self._sample_new_goal(a)
+                else:
+                    # Traditional MAPF: mark agent as done when goal is reached
+                    agent_done_early[a] = True
 
         # Only truncate by time (no "all goals reached" terminal condition now)
         truncated = self.timestep >= self.max_steps
-        dones = {a: truncated for a in self.agents}
+        dones = {a: (truncated or agent_done_early.get(a, False)) for a in self.agents}
         truncs = {a: truncated for a in self.agents}
 
         if truncated:
             self.agents = []
+        else:
+            # Remove agents that are done (reached goal in traditional MAPF mode)
+            self.agents = [a for a in self.agents if not dones.get(a, False)]
 
         return (
             self._get_observations(),
