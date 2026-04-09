@@ -4,7 +4,7 @@ import numpy as np
 import time
 
 from MAPF import MAPF
-from train_mapf import ActorHybrid
+from train_models import ActorHybrid
 
 
 # ============================================================

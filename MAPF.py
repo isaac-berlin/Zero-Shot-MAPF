@@ -1,13 +1,11 @@
 from typing import Dict, Optional, List, Tuple, Set
-import json
-import os
-import re
 import random
-import heapq
 import numpy as np
 from pettingzoo.utils import ParallelEnv
 from gymnasium import spaces
 import pygame
+
+from map_loader import load_map_configuration
 
 
 class MAPF(ParallelEnv):
@@ -75,9 +73,26 @@ class MAPF(ParallelEnv):
         self.goal_points: List[Tuple[int, int]] = []
         
         if map_path is not None:
-            self._load_map_file(map_path)
-            if num_agents is None and self.team_size is not None:
-                self.n_agents = self.team_size
+            loaded = load_map_configuration(
+                path=map_path,
+                requested_agents=self.n_agents,
+                default_grid_shape=(self.grid_h, self.grid_w),
+            )
+            self.grid_w = loaded.grid_w
+            self.grid_h = loaded.grid_h
+            self.blocked = set(loaded.blocked)
+            self.spawn_points = list(loaded.spawn_points)
+            self.goal_points = list(loaded.goal_points)
+            self._using_domain_config = loaded.using_domain_config
+
+            self.team_size = loaded.team_size
+            self.num_tasks_reveal = loaded.num_tasks_reveal
+            self.agent_size = loaded.agent_size
+            self.max_counter = loaded.max_counter
+            self.delay_config = loaded.delay_config
+
+            if num_agents is None and loaded.team_size is not None:
+                self.n_agents = loaded.team_size
         elif blocked_cells is not None:
             self.blocked = set(blocked_cells)
             self._validate_points("blocked_cells", self.blocked, [], [])
@@ -133,268 +148,8 @@ class MAPF(ParallelEnv):
                 self._blocked_grid[by, bx] = True
         
     # ============================================================
-    # Map file parsing
+    # Map validation
     # ============================================================
-    def _load_map_file(self, path: str) -> None:
-        """
-        Load either:
-        - .domain directory containing one or more benchmark JSON configs,
-        - benchmark JSON config (.json) that points to .map/.agents/.tasks files, or
-        - legacy text directive format.
-        """
-        resolved_path = path
-        norm = os.path.normpath(path)
-        if os.path.isdir(norm) or norm.lower().endswith(".domain"):
-            resolved_path = self._resolve_domain_config_json(norm)
-
-        if resolved_path.lower().endswith(".json"):
-            self._load_benchmark_json(resolved_path)
-        else:
-            self._load_legacy_map_file(resolved_path)
-
-    def _resolve_domain_config_json(self, domain_dir: str) -> str:
-        """
-        Resolve a .domain directory into a concrete benchmark JSON config file.
-
-        Selection strategy:
-        - if only one JSON exists: use it
-        - if multiple JSON files exist and num_agents is provided: prefer exact teamSize,
-          otherwise the smallest teamSize >= num_agents, otherwise the largest teamSize
-        - if no teamSize metadata can be used: pick lexicographically first file
-        """
-        if not os.path.isdir(domain_dir):
-            raise ValueError(f"{domain_dir}: expected an existing .domain directory.")
-
-        json_candidates = [
-            os.path.join(domain_dir, name)
-            for name in os.listdir(domain_dir)
-            if name.lower().endswith(".json")
-        ]
-        json_candidates.sort()
-
-        if not json_candidates:
-            raise ValueError(f"{domain_dir}: no JSON scenario files found in .domain directory.")
-        if len(json_candidates) == 1:
-            return json_candidates[0]
-
-        # Try selecting by teamSize when multiple scenarios are present.
-        annotated: List[Tuple[str, Optional[int]]] = []
-        for cfg_path in json_candidates:
-            team_size = None
-            try:
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-                if "teamSize" in cfg:
-                    team_size = int(cfg["teamSize"])
-            except Exception:
-                team_size = None
-            annotated.append((cfg_path, team_size))
-
-        if self.n_agents is not None:
-            exact = [p for (p, ts) in annotated if ts == self.n_agents]
-            if exact:
-                return sorted(exact)[0]
-
-            larger_or_equal = sorted(
-                [(p, ts) for (p, ts) in annotated if ts is not None and ts >= self.n_agents],
-                key=lambda item: (item[1], item[0]),
-            )
-            if larger_or_equal:
-                return larger_or_equal[0][0]
-
-            known_sizes = sorted(
-                [(p, ts) for (p, ts) in annotated if ts is not None],
-                key=lambda item: (item[1], item[0]),
-            )
-            if known_sizes:
-                return known_sizes[-1][0]
-
-        return annotated[0][0]
-
-    def _load_benchmark_json(self, path: str) -> None:
-        """Load benchmark-style config with mapFile/agentFile/taskFile fields."""
-        self._using_domain_config = True
-        with open(path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-
-        base_dir = os.path.dirname(path)
-
-        def resolve_rel(rel_path: str) -> str:
-            return os.path.normpath(os.path.join(base_dir, rel_path))
-
-        try:
-            map_file = resolve_rel(cfg["mapFile"])
-            agent_file = resolve_rel(cfg["agentFile"])
-            task_file = resolve_rel(cfg["taskFile"])
-        except KeyError as e:
-            raise ValueError(f"{path}: missing required key {e.args[0]!r}") from e
-
-        width, height, blocked = self._parse_octile_map_file(map_file)
-        self.grid_w = width
-        self.grid_h = height
-        self.blocked = blocked
-
-        self.spawn_points = self._parse_agents_file(agent_file)
-        self.goal_points = self._parse_tasks_file(task_file)
-
-        if "teamSize" in cfg:
-            self.team_size = int(cfg["teamSize"])
-        if "numTasksReveal" in cfg:
-            self.num_tasks_reveal = float(cfg["numTasksReveal"])
-        if "agentSize" in cfg:
-            self.agent_size = float(cfg["agentSize"])
-        # Some files use "agentCounter" while docs call it "maxCounter".
-        if "maxCounter" in cfg:
-            self.max_counter = int(cfg["maxCounter"])
-        elif "agentCounter" in cfg:
-            self.max_counter = int(cfg["agentCounter"])
-
-        delay_cfg = cfg.get("delayConfig", {})
-        if isinstance(delay_cfg, str):
-            delay_path = resolve_rel(delay_cfg)
-            with open(delay_path, "r", encoding="utf-8") as f:
-                self.delay_config = json.load(f)
-        elif isinstance(delay_cfg, dict):
-            self.delay_config = delay_cfg
-        else:
-            raise ValueError(f"{path}: delayConfig must be an object or relative json path.")
-
-        self._validate_points(path, self.blocked, self.spawn_points, self.goal_points)
-        self.spawn_points = self._dedup_points(self.spawn_points)
-        self.goal_points = self._dedup_points(self.goal_points)
-        self._refresh_blocked_grid()
-
-    def _parse_octile_map_file(self, path: str) -> Tuple[int, int, Set[Tuple[int, int]]]:
-        """
-        Parse a map in movingai "octile" text format and return (width, height, blocked).
-
-        Coordinates are converted into this env's (x, y) with y growing upward.
-        """
-        with open(path, "r", encoding="utf-8") as f:
-            raw_lines = [line.rstrip("\n") for line in f]
-
-        if len(raw_lines) < 4:
-            raise ValueError(f"{path}: invalid map file, expected at least 4 header lines.")
-
-        height = None
-        width = None
-        map_start = None
-
-        for i, line in enumerate(raw_lines):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            lower = stripped.lower()
-            if lower.startswith("height"):
-                parts = stripped.split()
-                if len(parts) < 2:
-                    raise ValueError(f"{path}:{i + 1}: malformed height line.")
-                height = int(parts[1])
-            elif lower.startswith("width"):
-                parts = stripped.split()
-                if len(parts) < 2:
-                    raise ValueError(f"{path}:{i + 1}: malformed width line.")
-                width = int(parts[1])
-            elif lower == "map":
-                map_start = i + 1
-                break
-
-        if height is None or width is None or map_start is None:
-            raise ValueError(f"{path}: expected header fields: height, width, and map.")
-        if height <= 1 or width <= 1:
-            raise ValueError(f"{path}: height and width must be > 1.")
-
-        if len(raw_lines) < map_start + height:
-            raise ValueError(f"{path}: expected {height} map rows, got fewer.")
-
-        blocked: Set[Tuple[int, int]] = set()
-        obstacle_symbols = {"@", "T"}
-
-        for row in range(height):
-            map_row = raw_lines[map_start + row]
-            if len(map_row) < width:
-                raise ValueError(
-                    f"{path}:{map_start + row + 1}: map row too short (expected {width}, got {len(map_row)})."
-                )
-            y = height - 1 - row
-            for x, symbol in enumerate(map_row[:width]):
-                if symbol in obstacle_symbols:
-                    blocked.add((x, y))
-
-        return width, height, blocked
-
-    def _linear_to_xy(self, loc: int, width: int, height: int, source: str) -> Tuple[int, int]:
-        if loc < 0:
-            raise ValueError(f"{source}: negative location index {loc}.")
-        row = loc // width
-        col = loc % width
-        if row >= height:
-            raise ValueError(f"{source}: location index {loc} is out of bounds for {height}x{width}.")
-        # Input row increases downward; env y increases upward.
-        return col, (height - 1 - row)
-
-    def _parse_agents_file(self, path: str) -> List[Tuple[int, int]]:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
-
-        if not lines:
-            raise ValueError(f"{path}: empty agents file.")
-
-        try:
-            n_agents = int(lines[0])
-        except ValueError as e:
-            raise ValueError(f"{path}: first non-comment line must be integer agent count.") from e
-
-        if len(lines) < 1 + n_agents:
-            raise ValueError(f"{path}: expected {n_agents} agent locations, found {len(lines) - 1}.")
-
-        starts: List[Tuple[int, int]] = []
-        for i in range(n_agents):
-            line = lines[1 + i]
-            nums = re.findall(r"-?\d+", line)
-            if not nums:
-                raise ValueError(f"{path}:{i + 2}: missing location index.")
-            loc = int(nums[0])
-            starts.append(self._linear_to_xy(loc, self.grid_w, self.grid_h, f"{path}:{i + 2}"))
-
-        return starts
-
-    def _parse_tasks_file(self, path: str) -> List[Tuple[int, int]]:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
-
-        if not lines:
-            raise ValueError(f"{path}: empty tasks file.")
-
-        try:
-            n_tasks = int(lines[0])
-        except ValueError as e:
-            raise ValueError(f"{path}: first non-comment line must be integer task count.") from e
-
-        if len(lines) < 1 + n_tasks:
-            raise ValueError(f"{path}: expected {n_tasks} task lines, found {len(lines) - 1}.")
-
-        points: List[Tuple[int, int]] = []
-        for i in range(n_tasks):
-            line = lines[1 + i]
-            nums = re.findall(r"-?\d+", line)
-            if not nums:
-                raise ValueError(f"{path}:{i + 2}: task line has no locations.")
-            for token in nums:
-                loc = int(token)
-                points.append(self._linear_to_xy(loc, self.grid_w, self.grid_h, f"{path}:{i + 2}"))
-
-        return points
-
-    @staticmethod
-    def _dedup_points(seq: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-        seen = set()
-        out = []
-        for item in seq:
-            if item not in seen:
-                seen.add(item)
-                out.append(item)
-        return out
 
     def _validate_points(
         self,
@@ -420,89 +175,6 @@ class MAPF(ParallelEnv):
                 raise ValueError(f"{source}: goal out of bounds: {p} for GRID {self.grid_h}x{self.grid_w}")
             if p in blocked:
                 raise ValueError(f"{source}: goal on blocked cell: {p}")
-
-    def _load_legacy_map_file(self, path: str) -> None:
-        """
-        Load a text map specification.
-
-        Supported directives (case-insensitive), one per line:
-
-            GRID <H> <W>
-                - sets grid shape to (H, W) (optional; overrides constructor arg)
-
-            BLOCK <x> <y>
-                - marks a single blocked cell
-
-            BLOCK_RECT <x1> <y1> <x2> <y2>
-                - marks a rectangle of blocked cells (inclusive)
-
-            SPAWN <x> <y>
-                - adds a candidate spawn location
-
-            GOAL <x> <y>
-                - adds a candidate goal location
-
-        Notes:
-        - Coordinates are 0-indexed and use the same (x, y) convention as the env.
-        - Lines starting with '#' or empty lines are ignored.
-        """
-        blocked: Set[Tuple[int, int]] = set()
-        spawns: List[Tuple[int, int]] = []
-        goals: List[Tuple[int, int]] = []
-
-        with open(path, "r", encoding="utf-8") as f:
-            for lineno, raw in enumerate(f, start=1):
-                line = raw.strip()
-                if not line or line.startswith("#"):
-                    continue
-
-                parts = line.split()
-                key = parts[0].upper()
-
-                def parse_ints(n: int) -> List[int]:
-                    if len(parts) != n + 1:
-                        raise ValueError(f"{path}:{lineno}: expected {n} ints after {parts[0]!r}, got: {parts[1:]}")
-                    try:
-                        return [int(v) for v in parts[1:]]
-                    except ValueError as e:
-                        raise ValueError(f"{path}:{lineno}: non-integer value in: {parts}") from e
-
-                if key == "GRID":
-                    h, w = parse_ints(2)
-                    if h <= 1 or w <= 1:
-                        raise ValueError(f"{path}:{lineno}: GRID dimensions must be > 1")
-                    self.grid_h = h
-                    self.grid_w = w
-
-                elif key == "BLOCK":
-                    x, y = parse_ints(2)
-                    blocked.add((x, y))
-
-                elif key == "BLOCK_RECT":
-                    x1, y1, x2, y2 = parse_ints(4)
-                    xa, xb = sorted((x1, x2))
-                    ya, yb = sorted((y1, y2))
-                    for x in range(xa, xb + 1):
-                        for y in range(ya, yb + 1):
-                            blocked.add((x, y))
-
-                elif key == "SPAWN":
-                    x, y = parse_ints(2)
-                    spawns.append((x, y))
-
-                elif key == "GOAL":
-                    x, y = parse_ints(2)
-                    goals.append((x, y))
-
-                else:
-                    raise ValueError(f"{path}:{lineno}: unknown directive {parts[0]!r}")
-
-        self._validate_points(path, blocked, spawns, goals)
-
-        self.blocked = set(blocked)
-        self.spawn_points = self._dedup_points(spawns)
-        self.goal_points = self._dedup_points(goals)
-        self._refresh_blocked_grid()
 
     def _random_free_cell(self, occupied: Set[Tuple[int, int]]) -> Tuple[int, int]:
         """Random free (non-blocked) cell not in occupied."""
@@ -862,53 +534,6 @@ class MAPF(ParallelEnv):
     # ============================================================
     # Rendering
     # ============================================================
-    def _agent_color(self, agent):
-        """Deterministic per-agent color (RGB)."""
-        # 10 distinct-ish colors; cycles if you have >10 agents
-        palette = [
-            (255, 99, 71),    # tomato
-            (54, 162, 235),   # blue
-            (255, 205, 86),   # yellow
-            (75, 192, 192),   # teal
-            (153, 102, 255),  # purple
-            (255, 159, 64),   # orange
-            (46, 204, 113),   # green
-            (231, 76, 60),    # red
-            (52, 73, 94),     # slate
-            (241, 196, 15),   # gold
-        ]
-        idx = int(agent.split("_")[-1]) if "_" in agent else 0
-        return palette[idx % len(palette)]
-
-    def _heading_to_triangle(self, cx, cy, heading, size):
-        """
-        Return 3 points for a triangle arrow centered at (cx, cy),
-        pointing along heading: 0=N,1=E,2=S,3=W.
-        """
-        # Tip points in heading direction; base is opposite.
-        if heading == 0:  # N
-            tip = (cx, cy - size)
-            left = (cx - size * 0.6, cy + size * 0.7)
-            right = (cx + size * 0.6, cy + size * 0.7)
-        elif heading == 1:  # E
-            tip = (cx + size, cy)
-            left = (cx - size * 0.7, cy - size * 0.6)
-            right = (cx - size * 0.7, cy + size * 0.6)
-        elif heading == 2:  # S
-            tip = (cx, cy + size)
-            left = (cx - size * 0.6, cy - size * 0.7)
-            right = (cx + size * 0.6, cy - size * 0.7)
-        else:  # 3=W
-            tip = (cx - size, cy)
-            left = (cx + size * 0.7, cy - size * 0.6)
-            right = (cx + size * 0.7, cy + size * 0.6)
-
-        # pygame wants ints
-        return [(int(tip[0]), int(tip[1])),
-                (int(left[0]), int(left[1])),
-                (int(right[0]), int(right[1]))]
-
-    
     def render(self, mode=None):
         if mode is None:
             mode = self.render_mode
@@ -1051,30 +676,6 @@ class MAPF(ParallelEnv):
             self._margin + (self.grid_h - 1 - y) * self._cell_size,
         )
         
-    def _compute_render_scale(self):
-        """
-        Choose cell size + margin so the grid fits on screen.
-
-        Uses self.grid_w, self.grid_h and clamps cell size into
-        [self._min_cell_size, self._max_cell_size].
-        """
-        # leave room for margin on both sides
-        avail_w = max(50, self._max_window_w - 2 * self._margin)
-        avail_h = max(50, self._max_window_h - 2 * self._margin)
-
-        # compute cell size that fits (floor)
-        cell_w = avail_w // self.grid_w
-        cell_h = avail_h // self.grid_h
-        cell = int(min(cell_w, cell_h))
-
-        # clamp
-        cell = max(self._min_cell_size, min(self._max_cell_size, cell))
-
-        # margin scales a bit with cell size (but keep reasonable)
-        margin = int(max(8, min(40, cell * 0.6)))
-
-        return cell, margin
-
     def close(self):
         if self._pygame_initialized:
             pygame.quit()
