@@ -23,7 +23,14 @@ Main behavior:
 
 - Observation mode: hybrid only.
 	- vector: goal direction in agent-relative coordinates.
-	- window: local spatial tensor around each agent.
+	- window: heading-aligned local tensor (rotated into agent frame).
+		- local +y is forward, local +x is right.
+		- channel 0: traversability map plus ego-center marker (1.0 at center).
+		- channel 1 shared encoding for non-ego entities:
+			- 0.5 other-agent goal
+			- 1.0 other-agent position
+			- 1.5 overlap of other-agent position and other-agent goal
+		- channel 2: own goal indicator.
 - Action space (Discrete(4)):
 	- 0 forward
 	- 1 turn right
@@ -42,6 +49,7 @@ Main behavior:
 Task modes:
 	- `lifelong=True` (default for training): immediate goal resampling on completion
 	- `lifelong=False` (for Moving AI evaluation): agents marked as done when goal is reached
+	- For benchmark/domain configs, goal resampling is constrained to task-defined goal locations only.
 - Episode termination:
 	- truncation by max step count only
 - Rendering:
@@ -69,6 +77,16 @@ Supported map inputs:
 
 2. Benchmark JSON scenario
 - Reads mapFile, agentFile, taskFile.
+- Strict consistency checks:
+	- teamSize must match the number of parsed agent starts from agentFile.
+	- numTasksReveal must be > 0 and cannot exceed parsed task locations.
+- agentFile format:
+	- first line is number of agents n
+	- next n lines each contain one integer start location index
+- taskFile format:
+	- first line is number of tasks m
+	- next m lines each contain one or more integer location indices
+	- order on each line is preserved
 - Parses optional metadata:
 	- teamSize
 	- numTasksReveal
@@ -201,9 +219,10 @@ Batch evaluator for Moving AI MAPF benchmark scenarios.
 What it does:
 
 - Discovers all .scen files in MovingAI_eval/ directory.
-- For each scenario, parses test cases (map file + start/goal positions).
-- Runs each test case with a trained actor for up to 5000 timesteps.
-- Tracks whether agents reached their goals and the number of steps taken.
+- Groups each scenario by bucket (first column in .scen file).
+- Runs one multi-agent traditional MAPF episode per bucket for up to 5000 timesteps.
+- Uses all rows in a bucket as that episode's agents (start/goal pairs).
+- Tracks whether all agents in the bucket finished before timeout and the number of steps taken.
 - Outputs three files:
 	- logs/moving_ai_results.json (all test results + scenario summaries)
 	- logs/moving_ai_results.csv (per-test-case results)
@@ -214,6 +233,9 @@ Configuration (edit at top of file):
 - `OBS_RADIUS`: Must match training value (default 5 for mappo_hybrid_16x16_10agents_mix_actor.pth)
 - `MAX_STEPS`: Episode length limit (default 5000)
 - `MOVING_AI_DIR`: Directory containing .scen and .map files (default "MovingAI_eval")
+- `SELECTED_SCENARIOS`: Optional scenario filename filter
+- `SELECTED_BUCKETS`: Optional bucket-id filter
+- `VISUALIZE_SINGLE_SELECTED_BUCKET`: If true, live-render when exactly one selected bucket is run
 
 ### generate_random_envs.py
 

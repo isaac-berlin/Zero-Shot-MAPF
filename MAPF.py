@@ -235,6 +235,19 @@ class MAPF(ParallelEnv):
         # -----------------------------
         occupied: Set[Tuple[int, int]] = set()
 
+        # If we must sample both spawns and goals from generic free cells,
+        # ensure capacity exists up front to avoid opaque "No free cells" errors.
+        if not self.spawn_points and not self.goal_points:
+            total_free_cells = (self.grid_w * self.grid_h) - len(self.blocked)
+            required_unique_cells = 2 * self.n_agents
+            if total_free_cells < required_unique_cells:
+                raise ValueError(
+                    "Not enough free cells to sample unique spawn and goal locations "
+                    f"for {self.n_agents} agents. "
+                    f"Need at least {required_unique_cells} free cells, "
+                    f"but map has {total_free_cells}."
+                )
+
         if self.spawn_points:
             if len(self.spawn_points) < self.n_agents:
                 raise ValueError(
@@ -418,7 +431,12 @@ class MAPF(ParallelEnv):
             if candidates:
                 self.goal_locations[agent] = random.choice(candidates)
                 return
-            # fall through to random if candidates exhausted
+            if self._using_domain_config:
+                raise ValueError(
+                    "No valid goal candidates remain in task-defined goal locations. "
+                    "Refusing to spawn goals outside allowed task areas."
+                )
+            # fall through to random if candidates exhausted (non-benchmark maps)
 
         self.goal_locations[agent] = self._random_free_cell(occupied)
     # ============================================================
@@ -505,44 +523,89 @@ class MAPF(ParallelEnv):
     # ============================================================
     def _obs_window(self, agent):
         ax, ay = self.agent_location[agent]
+        heading = self.agent_dir[agent]
         R = self.obs_radius
         W = 2 * R + 1
 
         obs = np.full((W, W, 3), -1.0, dtype=np.float32)
 
-        # Fill in-bounds window area with vectorized blocked lookup.
-        x0 = max(0, ax - R)
-        x1 = min(self.grid_w, ax + R + 1)
-        y0 = max(0, ay - R)
-        y1 = min(self.grid_h, ay + R + 1)
+        # Build a heading-aligned window: local +y is always "forward",
+        # local +x is always "right" for the observing agent.
+        def local_to_global_offset(local_right: int, local_forward: int, h: int) -> Tuple[int, int]:
+            if h == 0:  # North
+                return local_right, local_forward
+            if h == 1:  # East
+                return local_forward, -local_right
+            if h == 2:  # South
+                return -local_right, -local_forward
+            # h == 3, West
+            return -local_forward, local_right
 
-        ox0 = x0 - (ax - R)
-        ox1 = ox0 + (x1 - x0)
-        oy0 = y0 - (ay - R)
-        oy1 = oy0 + (y1 - y0)
+        def global_to_local_offset(dx: int, dy: int, h: int) -> Tuple[int, int]:
+            if h == 0:  # North
+                return dx, dy
+            if h == 1:  # East
+                return -dy, dx
+            if h == 2:  # South
+                return -dx, -dy
+            # h == 3, West
+            return dy, -dx
 
-        obs[ox0:ox1, oy0:oy1, :] = 0.0
-        local_blocked = self._blocked_grid[y0:y1, x0:x1].T
-        obs[ox0:ox1, oy0:oy1, 0] = np.where(local_blocked, -1.0, 0.0)
+        # Channel 0 is traversability in the rotated local frame.
+        for local_right in range(-R, R + 1):
+            for local_forward in range(-R, R + 1):
+                dx, dy = local_to_global_offset(local_right, local_forward, heading)
+                gx, gy = ax + dx, ay + dy
+                ix, iy = R + local_right, R + local_forward
 
-        # ego (channel 0 encodes heading at center cell)
-        # heading: 0=N,1=E,2=S,3=W -> 0.25,0.5,0.75,1.0
-        obs[R, R, 0] = (self.agent_dir[agent] + 1) / 4.0
+                if 0 <= gx < self.grid_w and 0 <= gy < self.grid_h:
+                    obs[ix, iy, :] = 0.0
+                    if self._blocked_grid[gy, gx]:
+                        obs[ix, iy, 0] = -1.0
 
-        # other agents (channel 1)
+        # Heading is now encoded by rotating the whole window; use a fixed
+        # ego-center marker instead of an absolute heading scalar.
+        obs[R, R, 0] = 1.0
+
+        # channel 1 shared encoding:
+        # 0.0 = empty
+        # 0.5 = other agent goal
+        # 1.0 = other agent position
+        # 1.5 = both other agent and other goal overlap
+
+        # other agents' goals first (channel 1 -> 0.5)
+        for other in self.agents:
+            if other == agent:
+                continue
+            gx_o, gy_o = self.goal_locations[other]
+            dx, dy = gx_o - ax, gy_o - ay
+            local_right, local_forward = global_to_local_offset(dx, dy, heading)
+            if -R <= local_right <= R and -R <= local_forward <= R:
+                ix = R + local_right
+                iy = R + local_forward
+                obs[ix, iy, 1] = max(obs[ix, iy, 1], 0.5)
+
+        # other agents (channel 1 -> 1.0, or 1.5 if overlapping with goal)
         for other in self.agents:
             if other == agent:
                 continue
             ox, oy = self.agent_location[other]
             dx, dy = ox - ax, oy - ay
-            if -R <= dx <= R and -R <= dy <= R:
-                obs[R + dx, R + dy, 1] = 1.0
+            local_right, local_forward = global_to_local_offset(dx, dy, heading)
+            if -R <= local_right <= R and -R <= local_forward <= R:
+                ix = R + local_right
+                iy = R + local_forward
+                if obs[ix, iy, 1] >= 0.5:
+                    obs[ix, iy, 1] = 1.5
+                else:
+                    obs[ix, iy, 1] = 1.0
 
         # own goal only (channel 2)
         gx, gy = self.goal_locations[agent]
         dx, dy = gx - ax, gy - ay
-        if -R <= dx <= R and -R <= dy <= R:
-            obs[R + dx, R + dy, 2] = 1.0
+        local_right, local_forward = global_to_local_offset(dx, dy, heading)
+        if -R <= local_right <= R and -R <= local_forward <= R:
+            obs[R + local_right, R + local_forward, 2] = 1.0
 
         return obs
 

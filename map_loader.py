@@ -42,22 +42,26 @@ def load_map_configuration(
     if resolved_path.lower().endswith(".json"):
         return _load_benchmark_json(resolved_path)
     
-    # Check if it's an octile map file (Moving AI format)
+    # For .map extensions, support both octile (Moving AI) and legacy directive maps.
     if resolved_path.lower().endswith(".map"):
-        width, height, blocked = _parse_octile_map_file(resolved_path)
-        return MapLoadResult(
-            grid_w=width,
-            grid_h=height,
-            blocked=set(blocked),
-            spawn_points=[],
-            goal_points=[],
-            using_domain_config=False,
-            team_size=None,
-            num_tasks_reveal=None,
-            agent_size=None,
-            max_counter=None,
-            delay_config={},
-        )
+        try:
+            width, height, blocked = _parse_octile_map_file(resolved_path)
+            return MapLoadResult(
+                grid_w=width,
+                grid_h=height,
+                blocked=set(blocked),
+                spawn_points=[],
+                goal_points=[],
+                using_domain_config=False,
+                team_size=None,
+                num_tasks_reveal=None,
+                agent_size=None,
+                max_counter=None,
+                delay_config={},
+            )
+        except ValueError:
+            # Fall back to legacy directive format (GRID/BLOCK/...)
+            return _load_legacy_map_file(resolved_path, grid_w=grid_w, grid_h=grid_h)
 
     return _load_legacy_map_file(resolved_path, grid_w=grid_w, grid_h=grid_h)
 
@@ -145,6 +149,19 @@ def _load_benchmark_json(path: str) -> MapLoadResult:
     num_tasks_reveal = float(cfg["numTasksReveal"]) if "numTasksReveal" in cfg else None
     agent_size = float(cfg["agentSize"]) if "agentSize" in cfg else None
 
+    if team_size is not None and team_size != len(spawn_points):
+        raise ValueError(
+            f"{path}: teamSize={team_size} does not match agentFile count={len(spawn_points)}."
+        )
+
+    if num_tasks_reveal is not None:
+        if num_tasks_reveal <= 0:
+            raise ValueError(f"{path}: numTasksReveal must be > 0, got {num_tasks_reveal}.")
+        if num_tasks_reveal > len(goal_points):
+            raise ValueError(
+                f"{path}: numTasksReveal={num_tasks_reveal} exceeds parsed task locations={len(goal_points)}."
+            )
+
     max_counter = None
     if "maxCounter" in cfg:
         max_counter = int(cfg["maxCounter"])
@@ -167,8 +184,10 @@ def _load_benchmark_json(path: str) -> MapLoadResult:
         grid_w=width,
         grid_h=height,
         blocked=set(blocked),
-        spawn_points=_dedup_points(spawn_points),
-        goal_points=_dedup_points(goal_points),
+        # Preserve exact file order/count for LoRR benchmark semantics.
+        # agentFile and taskFile are ordered datasets, not unordered pools.
+        spawn_points=list(spawn_points),
+        goal_points=list(goal_points),
         using_domain_config=True,
         team_size=team_size,
         num_tasks_reveal=num_tasks_reveal,
@@ -335,10 +354,15 @@ def _parse_agents_file(path: str, width: int, height: int) -> List[Tuple[int, in
     starts: List[Tuple[int, int]] = []
     for i in range(n_agents):
         line = lines[1 + i]
-        nums = re.findall(r"-?\d+", line)
-        if not nums:
-            raise ValueError(f"{path}:{i + 2}: missing location index.")
-        loc = int(nums[0])
+        tokens = line.split()
+        if len(tokens) != 1:
+            raise ValueError(
+                f"{path}:{i + 2}: each agent line must contain exactly one integer location index."
+            )
+        try:
+            loc = int(tokens[0])
+        except ValueError as e:
+            raise ValueError(f"{path}:{i + 2}: invalid integer location index {tokens[0]!r}.") from e
         starts.append(_linear_to_xy(loc, width, height, f"{path}:{i + 2}"))
 
     return starts
@@ -362,11 +386,17 @@ def _parse_tasks_file(path: str, width: int, height: int) -> List[Tuple[int, int
     points: List[Tuple[int, int]] = []
     for i in range(n_tasks):
         line = lines[1 + i]
-        nums = re.findall(r"-?\d+", line)
-        if not nums:
+        tokens = line.split()
+        if not tokens:
             raise ValueError(f"{path}:{i + 2}: task line has no locations.")
-        for token in nums:
-            loc = int(token)
+
+        # A task line may contain multiple location indices; preserve the
+        # order in which they appear on the line.
+        for token in tokens:
+            try:
+                loc = int(token)
+            except ValueError as e:
+                raise ValueError(f"{path}:{i + 2}: invalid integer location index {token!r}.") from e
             points.append(_linear_to_xy(loc, width, height, f"{path}:{i + 2}"))
 
     return points

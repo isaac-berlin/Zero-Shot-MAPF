@@ -173,6 +173,7 @@ if __name__ == "__main__":
         obs_mode="hybrid",
         stochastic=True,
         device=device,
-        map_path=r"maps\warehouse16.domain\maps\warehouse_16x16.map",
+        map_path=r"maps\warehouse16.domain\maps\warehouse_16x16_onewide.map",
         obs_radius=5,
+        num_agents=10
     )

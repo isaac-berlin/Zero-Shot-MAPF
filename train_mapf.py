@@ -20,7 +20,7 @@ from train_helpers import (
 TRAIN_GRID_SHAPE = (16, 16)
 TRAIN_NUM_AGENTS = 10
 TRAIN_OBS_RADIUS = 5
-TRAIN_SCENARIOS = ("warehouse", "random")
+TRAIN_SCENARIOS = ("warehouse", "warehouse_onewide", "random")
 TRAIN_RANDOM_ENV_POOL_SIZE = 1000
 TRAIN_ENV_SAMPLE_EVERY_EPISODES = 5
 TRAIN_TB_LOG_EVERY_EPISODES = 5

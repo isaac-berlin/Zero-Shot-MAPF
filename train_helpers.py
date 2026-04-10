@@ -10,6 +10,9 @@ from MAPF import MAPF
 
 
 WAREHOUSE_MAP_PATH = Path("maps") / "warehouse16.domain" / "maps" / "warehouse_16x16.map"
+WAREHOUSE_ONEWIDE_MAP_PATH = (
+    Path("maps") / "warehouse16.domain" / "maps" / "warehouse_16x16_onewide.map"
+)
 
 
 def set_seed(seed=0):
@@ -104,6 +107,19 @@ def build_episode_env(
             "scenario": "warehouse",
             "obstacle_density": 0.0,
             "map_path": str(WAREHOUSE_MAP_PATH),
+        }
+
+    if scenario == "warehouse_onewide":
+        return MAPF(
+            obs_mode="hybrid",
+            obs_radius=obs_radius,
+            map_path=str(WAREHOUSE_ONEWIDE_MAP_PATH),
+            num_agents=num_agents,
+            grid_shape=grid_shape,
+        ), {
+            "scenario": "warehouse_onewide",
+            "obstacle_density": 0.0,
+            "map_path": str(WAREHOUSE_ONEWIDE_MAP_PATH),
         }
 
     if scenario == "random":
