@@ -20,7 +20,28 @@ from train_helpers import (
 TRAIN_GRID_SHAPE = (16, 16)
 TRAIN_NUM_AGENTS = 10
 TRAIN_OBS_RADIUS = 5
-TRAIN_SCENARIOS = ("warehouse", "warehouse_onewide", "random")
+
+# Scenario-mix presets for training regime selection.
+# - random_only: 100% random maps
+# - half_random_half_warehouses: 50% random, 25% warehouse, 25% warehouse_onewide
+# - thirds_all: 1/3 each of random, warehouse, warehouse_onewide
+TRAIN_SCENARIO_PRESETS = {
+    "random_only": {
+        "scenarios": ("random",),
+        "weights": (1.0,),
+    },
+    "half_random_half_warehouses": {
+        "scenarios": ("random", "warehouse", "warehouse_onewide"),
+        "weights": (0.50, 0.25, 0.25),
+    },
+    "thirds_all": {
+        "scenarios": ("random", "warehouse", "warehouse_onewide"),
+        "weights": (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0),
+    },
+}
+
+TRAIN_SCENARIO_PRESET = "random_only"
+
 TRAIN_RANDOM_ENV_POOL_SIZE = 1000
 TRAIN_ENV_SAMPLE_EVERY_EPISODES = 5
 TRAIN_TB_LOG_EVERY_EPISODES = 5
@@ -46,17 +67,41 @@ def train_mappo(
     obs_radius=TRAIN_OBS_RADIUS,
     obstacle_density_range=(0.0, 0.5),
     random_env_dir=TRAIN_RANDOM_ENV_DIR,
+    scenario_preset=TRAIN_SCENARIO_PRESET,
 ):
-    random_layout_pool = build_random_layout_pool_from_dir(
-        Path(random_env_dir),
-        TRAIN_RANDOM_ENV_POOL_SIZE,
-    )
+    if scenario_preset not in TRAIN_SCENARIO_PRESETS:
+        valid = ", ".join(sorted(TRAIN_SCENARIO_PRESETS.keys()))
+        raise ValueError(f"Unknown scenario_preset={scenario_preset!r}. Valid presets: {valid}")
+
+    preset = TRAIN_SCENARIO_PRESETS[scenario_preset]
+    scenario_names = tuple(preset["scenarios"])
+    scenario_weights = tuple(preset["weights"])
+
+    uses_random = "random" in scenario_names
+    random_layout_pool = []
+    if uses_random:
+        random_layout_pool = build_random_layout_pool_from_dir(
+            Path(random_env_dir),
+            TRAIN_RANDOM_ENV_POOL_SIZE,
+        )
+
+    # Build one prototype env for inferring observation/action specs.
+    if "warehouse" in scenario_names:
+        prototype_scenario = "warehouse"
+        prototype_layout = None
+    elif "warehouse_onewide" in scenario_names:
+        prototype_scenario = "warehouse_onewide"
+        prototype_layout = None
+    else:
+        prototype_scenario = "random"
+        prototype_layout = random_layout_pool[0]
 
     prototype_env, _ = build_episode_env(
-        scenario="warehouse",
+        scenario=prototype_scenario,
         obs_radius=obs_radius,
         num_agents=num_agents,
         grid_shape=grid_shape,
+        random_layout=prototype_layout,
     )
 
     agent_order = prototype_env.possible_agents[:]
@@ -84,7 +129,7 @@ def train_mappo(
     )
 
     buffer = RolloutBuffer(agent_order)
-    writer = SummaryWriter(log_dir=f"runs/mapf_hybrid_{grid_shape[0]}x{grid_shape[1]}_{num_agents}agents_mix")
+    writer = SummaryWriter(log_dir=f"runs/mapf_hybrid_v3_agents_mix")
 
     episode = 0
     step_count = 0
@@ -102,10 +147,16 @@ def train_mappo(
     collisions_ep = 0
     episodes_until_resample = 0
 
+    print(f"Using scenario preset: {scenario_preset}")
+    print(f"  scenarios={scenario_names}")
+    print(f"  weights={scenario_weights}")
+
     def start_episode_env():
-        scenario = random.choice(TRAIN_SCENARIOS)
+        scenario = random.choices(scenario_names, weights=scenario_weights, k=1)[0]
         layout = None
         if scenario == "random":
+            if not random_layout_pool:
+                raise RuntimeError("Scenario preset selected random maps but random layout pool is empty.")
             layout = random.choice(random_layout_pool)
         episode_env, episode_meta = build_episode_env(
             scenario=scenario,
@@ -321,8 +372,8 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    algo = train_mappo(total_episodes=1000, rollout_len=128, device=device)
+    algo = train_mappo(total_episodes=2500, rollout_len=128, device=device)
     torch.save(
         algo.actor.state_dict(),
-        f"mappo_hybrid_{TRAIN_GRID_SHAPE[0]}x{TRAIN_GRID_SHAPE[1]}_{TRAIN_NUM_AGENTS}agents_mix_actor.pth",
+        f"mappo_hybrid_agents_mix_v3_actor.pth",
     )
