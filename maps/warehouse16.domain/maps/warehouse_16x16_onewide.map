@@ -1,0 +1,20 @@
+GRID 16 16
+# Outer walls
+BLOCK_RECT 0 0 15 0
+BLOCK_RECT 0 15 15 15
+BLOCK_RECT 0 0 0 15
+BLOCK_RECT 15 0 15 15
+
+# Warehouse shelves with one-cell-wide corridors.
+# Vertical shelf blocks are split to keep a one-cell horizontal cross-aisle at y=7.
+BLOCK_RECT 2 2 3 6
+BLOCK_RECT 2 8 3 13
+
+BLOCK_RECT 5 2 6 6
+BLOCK_RECT 5 8 6 13
+
+BLOCK_RECT 8 2 9 6
+BLOCK_RECT 8 8 9 13
+
+BLOCK_RECT 11 2 12 6
+BLOCK_RECT 11 8 12 13

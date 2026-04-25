@@ -630,7 +630,8 @@ class MAPF(ParallelEnv):
         self._screen.blit(self._static_surface, (0, 0))
 
         # goals/targets: orange squares with agent number
-        for agent in self.possible_agents:
+        # Render goals only for active agents so completed/removed agents do not leave stale targets.
+        for agent in self.agents:
             gx, gy = self.goal_locations[agent]
             sx, sy = self._grid_to_screen(gx, gy)
             goal_color = (255, 140, 0)  # orange

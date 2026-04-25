@@ -169,11 +169,11 @@ if __name__ == "__main__":
     # - a benchmark .json scenario file, or
     # - a legacy text map file.
     run_policy(
-        actor_path="mappo_hybrid_16x16_10agents_mix_actor.pth",  # or mappo_window_actor.pth or mappo_hybrid_actor.pth
+        actor_path="mappo_hybrid_agents_mix_v3_actor.pth",  # or mappo_window_actor.pth or mappo_hybrid_actor.pth
         obs_mode="hybrid",
         stochastic=True,
         device=device,
-        map_path=r"maps\warehouse16.domain\maps\warehouse_16x16_onewide.map",
+        map_path=r"C:\Users\isaac\dev\Zero-Shot-MAPF\LORR_eval\warehouse.domain\maps\sortation_large.map",
         obs_radius=5,
-        num_agents=10
+        num_agents=2
     )

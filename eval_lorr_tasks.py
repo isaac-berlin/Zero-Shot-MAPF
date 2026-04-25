@@ -18,7 +18,7 @@ from run_mapf import load_actor_for_mode
 # ============================================================
 # Editable hardcoded config
 # ============================================================
-ACTOR_PATH = "mappo_hybrid_16x16_10agents_mix_actor.pth"
+ACTOR_PATH = "mappo_hybrid_agents_mix_v3_actor.pth"
 OBS_MODE = "hybrid"
 EPISODES = 1
 STOCHASTIC = True
@@ -182,9 +182,10 @@ def write_logs(
     scenario_summaries: List[Dict],
     output_dir: Path,
 ) -> None:
+    """Write the current evaluation results to JSON and CSV files."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    json_out = output_dir / "lorr_task_reaches.json"
+    json_out = output_dir / "lorr_task_reaches_v3.json"
     with json_out.open("w", encoding="utf-8") as f:
         json.dump(
             {
@@ -199,7 +200,7 @@ def write_logs(
     for row in episode_rows:
         max_agents = max(max_agents, len(row["per_agent_reaches"]))
 
-    csv_out = output_dir / "lorr_task_reaches.csv"
+    csv_out = output_dir / "lorr_task_reaches_v3.csv"
     fieldnames = ["scenario", "episode", "steps", "total_reaches"] + [
         f"agent_{i}_reaches" for i in range(max_agents)
     ]
@@ -269,11 +270,11 @@ def main() -> None:
                 }
             )
 
-    write_logs(all_episode_rows, all_summaries, OUTPUT_DIR)
+        write_logs(all_episode_rows, all_summaries, OUTPUT_DIR)
 
     print("\nWrote logs:")
-    print(f"  {(OUTPUT_DIR / 'lorr_task_reaches.json').as_posix()}")
-    print(f"  {(OUTPUT_DIR / 'lorr_task_reaches.csv').as_posix()}")
+    print(f"  {(OUTPUT_DIR / 'lorr_task_reaches_v3.json').as_posix()}")
+    print(f"  {(OUTPUT_DIR / 'lorr_task_reaches_v3.csv').as_posix()}")
 
 
 if __name__ == "__main__":

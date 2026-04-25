@@ -3,18 +3,20 @@ Evaluate a trained model on Moving AI MAPF benchmark scenarios.
 
 This script:
 1. Finds all .scen files in MovingAI_eval directory
-2. For each scenario and bucket group:
-    - Groups rows by the first column (bucket id)
-    - Runs one multi-agent traditional MAPF episode per bucket
-    - Sets starts/goals from all rows in that bucket
+2. For each scenario file:
+    - Ignores bucket ids in the .scen rows
+    - Uses each feasible team size from {5, 10, 15, 20, 25}
+    - Runs 10 random samples per team size from scenario rows
+    - Runs one multi-agent traditional MAPF episode per sampled set
     - Runs the model for up to 5000 timesteps
     - Tracks completion status and number of steps
-3. If exactly one selected bucket is run, optional live visualization is enabled
+3. If exactly one selected scenario is run, optional live visualization is enabled
 4. Outputs results to JSON and CSV logs
 """
 
 import csv
 import json
+import random
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -35,7 +37,7 @@ from run_mapf import load_actor_for_mode
 # ============================================================
 # Editable hardcoded config
 # ============================================================
-ACTOR_PATH = "mappo_hybrid_16x16_10agents_mix_actor.pth"
+ACTOR_PATH = "mappo_hybrid_agents_mix_v3_actor.pth"
 OBS_MODE = "hybrid"
 STOCHASTIC = True
 OBS_RADIUS = 5  # Must match training obs_radius
@@ -46,8 +48,9 @@ SHOW_TQDM = True
 MAX_STEPS = 5000
 MOVING_AI_DIR = Path("MovingAI_eval")
 SELECTED_SCENARIOS: List[str] = []  # e.g. ["Berlin_1_256-even-1.scen"]; empty => all
-SELECTED_BUCKETS: List[int] = []  # e.g. [11]; empty => all
-VISUALIZE_SINGLE_SELECTED_BUCKET = True
+SAMPLED_AGENT_COUNTS: Tuple[int, ...] = (5, 10, 15, 20, 25)
+RUNS_PER_TEAM_SIZE = 10
+VISUALIZE_SINGLE_SELECTED_SCENARIO = True
 
 
 def select_actions_batch(
@@ -85,21 +88,9 @@ def select_actions_batch(
     return {a: int(actions_t[i].item()) for i, a in enumerate(agent_order)}
 
 
-def _group_cases_by_bucket(cases: List[MovingAIScenarioCase]) -> List[Tuple[int, List[MovingAIScenarioCase]]]:
-    grouped: Dict[int, List[MovingAIScenarioCase]] = {}
-    ordered_buckets: List[int] = []
-    for case in cases:
-        if case.bucket not in grouped:
-            grouped[case.bucket] = []
-            ordered_buckets.append(case.bucket)
-        grouped[case.bucket].append(case)
-    return [(bucket, grouped[bucket]) for bucket in ordered_buckets]
-
-
-def run_moving_ai_bucket_test(
+def run_moving_ai_sampled_test(
     test_key: str,
-    bucket: int,
-    bucket_cases: List[MovingAIScenarioCase],
+    sampled_cases: List[MovingAIScenarioCase],
     actor_path: str,
     obs_mode: str,
     device: str,
@@ -108,30 +99,28 @@ def run_moving_ai_bucket_test(
     seed: int,
     visualize: bool = False,
 ) -> Dict:
-    """Run one traditional MAPF test for all rows in a single bucket."""
-    if not bucket_cases:
+    """Run one traditional MAPF test for sampled rows from a scenario file."""
+    if not sampled_cases:
         return {
             "test_case": test_key,
-            "bucket": bucket,
             "completed": False,
             "steps": 0,
             "num_agents": 0,
-            "error": "Empty bucket.",
+            "error": "No sampled cases.",
         }
 
-    map_paths = {case.map_file for case in bucket_cases}
+    map_paths = {case.map_file for case in sampled_cases}
     if len(map_paths) != 1:
         return {
             "test_case": test_key,
-            "bucket": bucket,
             "completed": False,
             "steps": 0,
-            "num_agents": len(bucket_cases),
-            "error": "Bucket contains multiple map files.",
+            "num_agents": len(sampled_cases),
+            "error": "Sampled rows contain multiple map files.",
         }
 
-    map_path = bucket_cases[0].map_file
-    num_agents = len(bucket_cases)
+    map_path = sampled_cases[0].map_file
+    num_agents = len(sampled_cases)
 
     try:
         env = MAPF(
@@ -145,8 +134,8 @@ def run_moving_ai_bucket_test(
         obs, _ = env.reset(seed=seed)
         agent_order = env.possible_agents[:]
 
-        # Override starts/goals from this bucket.
-        for idx, case in enumerate(bucket_cases):
+        # Override starts/goals from sampled scenario rows.
+        for idx, case in enumerate(sampled_cases):
             agent_name = agent_order[idx]
             env.agent_location[agent_name] = (case.start_x, case.start_y)
             env.goal_locations[agent_name] = (case.goal_x, case.goal_y)
@@ -201,7 +190,6 @@ def run_moving_ai_bucket_test(
 
         return {
             "test_case": test_key,
-            "bucket": bucket,
             "completed": completed,
             "steps": steps,
             "max_steps": MAX_STEPS,
@@ -212,7 +200,6 @@ def run_moving_ai_bucket_test(
     except Exception as e:
         return {
             "test_case": test_key,
-            "bucket": bucket,
             "completed": False,
             "steps": 0,
             "num_agents": num_agents,
@@ -228,12 +215,12 @@ def run_scenario_file(
     stochastic: bool,
     obs_radius: int,
     seed: int,
-    max_buckets: int = None,
-    selected_buckets: List[int] = None,
-    visualize_single_selected_bucket: bool = False,
+    sampled_agent_counts: Tuple[int, ...],
+    runs_per_team_size: int,
+    visualize: bool = False,
 ) -> Tuple[List[Dict], Dict]:
     """
-    Run all bucket tests from a Moving AI scenario file.
+    Run repeated sampled-row tests from a Moving AI scenario file.
     
     Args:
         scenario_path: Path to the .scen file
@@ -243,71 +230,78 @@ def run_scenario_file(
         stochastic: Whether to sample actions
         obs_radius: Observation radius
         seed: Random seed
-        max_buckets: Maximum number of buckets to run (None = all)
-        selected_buckets: Optional explicit bucket ids to evaluate
-        visualize_single_selected_bucket: Render live if exactly one bucket is selected
+        sampled_agent_counts: Candidate team sizes to sample from.
+        runs_per_team_size: Number of random samples per feasible team size.
+        visualize: Render the episode live if True.
         
     Returns:
         Tuple of (list of per-case results, summary dict)
     """
     try:
         cases = parse_moving_ai_scenario(str(scenario_path))
-        bucket_groups = _group_cases_by_bucket(cases)
+        if not cases:
+            raise RuntimeError("Scenario file has no test rows.")
 
-        if selected_buckets:
-            selected = set(selected_buckets)
-            bucket_groups = [pair for pair in bucket_groups if pair[0] in selected]
+        rng = random.Random(seed)
+        feasible_sizes = [n for n in sampled_agent_counts if n <= len(cases)]
+        if not feasible_sizes:
+            raise RuntimeError(
+                f"Scenario has {len(cases)} rows, but no requested sample size fits: {sampled_agent_counts}."
+            )
 
-        if max_buckets is not None:
-            bucket_groups = bucket_groups[:max_buckets]
-
-        should_visualize = visualize_single_selected_bucket and len(bucket_groups) == 1
-        
-        results = []
+        results: List[Dict] = []
         completed_count = 0
         total_steps = 0
 
-        for idx, (bucket, bucket_cases) in enumerate(bucket_groups, start=1):
-            test_case_key = f"{scenario_path.stem}_bucket_{bucket}"
+        total_runs = len(feasible_sizes) * runs_per_team_size
+        run_index = 0
 
-            print(
-                f"  [{idx}/{len(bucket_groups)}] {test_case_key} "
-                f"(agents={len(bucket_cases)})... ",
-                end="",
-                flush=True,
-            )
+        for team_size in feasible_sizes:
+            for rep in range(1, runs_per_team_size + 1):
+                run_index += 1
+                sampled_cases = rng.sample(cases, team_size)
+                test_case_key = f"{scenario_path.stem}_n{team_size}_run{rep:02d}"
 
-            result = run_moving_ai_bucket_test(
-                test_key=test_case_key,
-                bucket=bucket,
-                bucket_cases=bucket_cases,
-                actor_path=actor_path,
-                obs_mode=obs_mode,
-                device=device,
-                stochastic=stochastic,
-                obs_radius=obs_radius,
-                seed=seed + idx,
-                visualize=should_visualize,
-            )
-            
-            results.append(result)
-            
-            if result.get("completed", False):
-                completed_count += 1
-                total_steps += result["steps"]
-                print(f"✓ ({result['steps']} steps)")
-            elif "error" in result:
-                print(f"✗ ERROR: {result['error']}")
-            else:
-                total_steps += result["steps"]
-                print(f"✗ ({result['steps']} steps, timeout)")
-        
+                print(
+                    f"  [{run_index}/{total_runs}] {test_case_key}... ",
+                    end="",
+                    flush=True,
+                )
+
+                result = run_moving_ai_sampled_test(
+                    test_key=test_case_key,
+                    sampled_cases=sampled_cases,
+                    actor_path=actor_path,
+                    obs_mode=obs_mode,
+                    device=device,
+                    stochastic=stochastic,
+                    obs_radius=obs_radius,
+                    seed=seed + run_index,
+                    visualize=visualize and total_runs == 1,
+                )
+
+                result["sampled_agents"] = team_size
+                result["replicate"] = rep
+                results.append(result)
+
+                if result.get("completed", False):
+                    completed_count += 1
+                    total_steps += int(result.get("steps", 0))
+                    print(f"✓ ({result['steps']} steps)")
+                elif "error" in result:
+                    print(f"✗ ERROR: {result['error']}")
+                else:
+                    total_steps += int(result.get("steps", 0))
+                    print(f"✗ ({result['steps']} steps, timeout)")
+
         summary = {
             "scenario": str(scenario_path).replace("\\", "/"),
-            "total_buckets": len(bucket_groups),
             "total_rows": len(cases),
+            "team_sizes": ",".join(str(n) for n in feasible_sizes),
+            "runs_per_team_size": runs_per_team_size,
+            "runs": total_runs,
             "completed": completed_count,
-            "success_rate": completed_count / len(bucket_groups) if bucket_groups else 0,
+            "success_rate": completed_count / total_runs if total_runs > 0 else 0.0,
             "total_steps": total_steps,
             "avg_steps_completed": total_steps / completed_count if completed_count > 0 else 0,
         }
@@ -345,7 +339,17 @@ def write_logs(
     
     # CSV output
     csv_out = output_dir / "moving_ai_results.csv"
-    fieldnames = ["test_case", "bucket", "num_agents", "map_file", "completed", "steps", "max_steps", "error"]
+    fieldnames = [
+        "test_case",
+        "sampled_agents",
+        "replicate",
+        "num_agents",
+        "map_file",
+        "completed",
+        "steps",
+        "max_steps",
+        "error",
+    ]
     
     with csv_out.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -357,8 +361,10 @@ def write_logs(
     summary_csv = output_dir / "moving_ai_summary.csv"
     summary_fieldnames = [
         "scenario",
-        "total_buckets",
         "total_rows",
+        "team_sizes",
+        "runs_per_team_size",
+        "runs",
         "completed",
         "success_rate",
         "total_steps",
@@ -414,10 +420,10 @@ def main() -> None:
         f"obs_mode={OBS_MODE}, stochastic={STOCHASTIC}, "
         f"max_steps={MAX_STEPS}, device={device}"
     )
+    print(f"Sample sizes: {list(SAMPLED_AGENT_COUNTS)}")
+    print(f"Runs per team size: {RUNS_PER_TEAM_SIZE}")
     if SELECTED_SCENARIOS:
         print(f"Selected scenarios: {SELECTED_SCENARIOS}")
-    if SELECTED_BUCKETS:
-        print(f"Selected buckets: {sorted(SELECTED_BUCKETS)}")
     print()
     
     all_test_results: List[Dict] = []
@@ -433,9 +439,10 @@ def main() -> None:
             device=device,
             stochastic=STOCHASTIC,
             obs_radius=OBS_RADIUS,
-            seed=SEED,
-            selected_buckets=SELECTED_BUCKETS,
-            visualize_single_selected_bucket=VISUALIZE_SINGLE_SELECTED_BUCKET,
+            seed=SEED + idx,
+            sampled_agent_counts=SAMPLED_AGENT_COUNTS,
+            runs_per_team_size=RUNS_PER_TEAM_SIZE,
+            visualize=VISUALIZE_SINGLE_SELECTED_SCENARIO and len(moving_ai_scenarios) == 1,
         )
         
         all_test_results.extend(test_results)
@@ -443,7 +450,8 @@ def main() -> None:
         
         if "failed" not in summary:
             print(
-                f"  Summary: {summary['completed']}/{summary['total_buckets']} completed, "
+                f"  Summary: {summary['completed']}/{summary['runs']} completed "
+                f"(team_sizes={summary['team_sizes']}), "
                 f"success_rate={summary['success_rate']:.2%}"
             )
         print()
